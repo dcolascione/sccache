@@ -789,11 +789,17 @@ where
                 );
 
                 let out_pretty2 = out_pretty.clone();
+                let only_if_absent = miss_type == MissType::Normal;
                 // Try to finish storing the newly-written cache
                 // entry. We'll get the result back elsewhere.
                 let future = async move {
                     let start = Instant::now();
-                    match storage.put(&key, entry).await {
+                    let result = if only_if_absent {
+                        storage.put_if_absent(&key, entry).await
+                    } else {
+                        storage.put(&key, entry).await
+                    };
+                    match result {
                         Ok(_) => {
                             debug!("[{}]: Stored in cache successfully!", out_pretty2);
                             Ok(CacheWriteInfo {
@@ -3010,31 +3016,28 @@ LLVM version: 6.0",
         }
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_compiler_get_cached_or_compile_force_recache(preprocessor_cache_mode: bool) {
+    #[test_case(true, LocalCacheBackend::Disk ; "disk with preprocessor cache")]
+    #[test_case(false, LocalCacheBackend::Disk ; "disk without preprocessor cache")]
+    #[test_case(true, LocalCacheBackend::Directory ; "directory with preprocessor cache")]
+    #[test_case(false, LocalCacheBackend::Directory ; "directory without preprocessor cache")]
+    fn test_compiler_get_cached_or_compile_force_recache(
+        preprocessor_cache_mode: bool,
+        cache_backend: LocalCacheBackend,
+    ) {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
         let gcc = f.mk_bin("gcc").unwrap();
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
-        let storage = DiskCache::new(
-            f.tempdir.path().join("cache"),
-            u64::MAX,
+        let storage = cache_backend.storage(
+            f.tempdir.path().join(format!("{cache_backend:?}-recache")),
             &pool,
-            PreprocessorCacheModeConfig {
-                use_preprocessor_cache_mode: preprocessor_cache_mode,
-                ..Default::default()
-            },
-            CacheMode::ReadWrite,
-            vec![],
+            preprocessor_cache_mode,
         );
-        let storage = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
-        // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
-        // Pretend to be GCC.
+
         next_command(
             &creator,
             Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
@@ -3051,23 +3054,23 @@ LLVM version: 6.0",
         .wait()
         .unwrap()
         .0;
+
         const COMPILER_STDOUT: &[u8] = b"compiler stdout";
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
-        // The compiler should be invoked twice, since we're forcing
-        // recaching.
         let obj = f.tempdir.path().join("foo.o");
-        for _ in 0..2 {
-            // The preprocessor invocation.
+        for contents in [
+            b"first file contents".as_slice(),
+            b"second file contents".as_slice(),
+        ] {
             next_command(
                 &creator,
                 Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
             );
-            // The compiler invocation.
             let o = obj.clone();
+            let contents = contents.to_vec();
             next_command_calls(&creator, move |_| {
-                // Pretend to compile something.
                 let mut f = File::create(&o)?;
-                f.write_all(b"file contents")?;
+                f.write_all(&contents)?;
                 Ok(MockChild::new(
                     exit_status(0),
                     COMPILER_STDOUT,
@@ -3075,44 +3078,64 @@ LLVM version: 6.0",
                 ))
             });
         }
+
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
             o => panic!("Bad result from parse_arguments: {:?}", o),
         };
-        let (cached, res) = runtime
-            .block_on(async {
-                hasher
-                    .get_cached_or_compile(
-                        &service,
-                        None,
-                        creator.clone(),
-                        storage.clone(),
-                        arguments.clone(),
-                        cwd.to_path_buf(),
-                        vec![],
-                        CacheControl::Default,
-                        pool.clone(),
-                    )
-                    .await
-            })
+
+        let (cached, _) = runtime
+            .block_on(hasher.get_cached_or_compile(
+                &service,
+                None,
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool.clone(),
+            ))
             .unwrap();
-        // Ensure that the object file was created.
-        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
-                // wait on cache write future so we don't race with it!
-                f.wait().unwrap();
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, future) => {
+                future.wait().unwrap();
             }
             _ => panic!("Unexpected compile result: {:?}", cached),
         }
-        assert_eq!(exit_status(0), res.status);
-        assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
-        assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
-        // Now compile again, but force recaching.
+        assert_eq!(fs::read(&obj).unwrap(), b"first file contents");
+
         fs::remove_file(&obj).unwrap();
-        let (cached, res) = hasher
+        let (cached, _) = hasher
+            .get_cached_or_compile(
+                &service,
+                None,
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::ForceRecache,
+                pool.clone(),
+            )
+            .wait()
+            .unwrap();
+        match cached {
+            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, future) => {
+                future.wait().unwrap();
+            }
+            _ => panic!("Unexpected compile result: {:?}", cached),
+        }
+        assert_eq!(fs::read(&obj).unwrap(), b"second file contents");
+
+        fs::remove_file(&obj).unwrap();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let (cached, result) = hasher
             .get_cached_or_compile(
                 &service,
                 None,
@@ -3121,23 +3144,16 @@ LLVM version: 6.0",
                 arguments,
                 cwd.to_path_buf(),
                 vec![],
-                CacheControl::ForceRecache,
+                CacheControl::Default,
                 pool,
             )
             .wait()
             .unwrap();
-        // Ensure that the object file was created.
-        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
-        match cached {
-            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, f) => {
-                // wait on cache write future so we don't race with it!
-                f.wait().unwrap();
-            }
-            _ => panic!("Unexpected compile result: {:?}", cached),
-        }
-        assert_eq!(exit_status(0), res.status);
-        assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
-        assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
+        assert!(matches!(cached, CompileResult::CacheHit(_)));
+        assert_eq!(exit_status(0), result.status);
+        assert_eq!(COMPILER_STDOUT, result.stdout.as_slice());
+        assert_eq!(COMPILER_STDERR, result.stderr.as_slice());
+        assert_eq!(fs::read(&obj).unwrap(), b"second file contents");
     }
 
     #[test_case(true ; "with preprocessor cache")]

@@ -89,6 +89,14 @@ pub trait Storage: Send + Sync {
     /// finished.
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration>;
 
+    /// Put `entry` under `key` only if no entry is already present.
+    ///
+    /// Backends without atomic conditional publication may use the default
+    /// replacement behavior.
+    async fn put_if_absent(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
+        self.put(key, entry).await
+    }
+
     /// Get raw serialized cache entry bytes by `key` (for multi-level backfill).
     /// Returns `None` if the entry is not found, or if the implementation doesn't support raw access.
     /// This is used by multi-level caches to backfill faster levels.

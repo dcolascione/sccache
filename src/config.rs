@@ -787,19 +787,89 @@ impl Default for DistConfig {
     }
 }
 
-// TODO: fields only pub for tests
-#[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
+pub struct CompileExecutionConfig {
+    pub client_side_mode: bool,
+    pub serverless: bool,
+}
+
+impl CompileExecutionConfig {
+    fn resolve(env: EnvCompileExecutionConfig, file: Self, dist: &DistConfig) -> Result<Self> {
+        let serverless = env.serverless.unwrap_or(file.serverless);
+        if serverless && dist.scheduler_url.is_some() {
+            bail!("Serverless mode is not compatible with distributed compilation");
+        }
+
+        let client_side_mode = !serverless
+            && env.client_side_mode.unwrap_or(file.client_side_mode)
+            // Logging always writes to stderr in the client process, disregarding
+            // SCCACHE_ERROR_LOG. Until concurrent client logging is addressed,
+            // retain the existing client-side-mode restriction.
+            && env::var_os(crate::LOGGING_ENV).is_none()
+            && dist.scheduler_url.is_none();
+
+        Ok(Self {
+            client_side_mode,
+            serverless,
+        })
+    }
+}
+
+// TODO: fields only pub for tests
+#[derive(Debug, Default, Serialize, Eq, PartialEq)]
 pub struct FileConfig {
     pub cache: CacheConfigs,
     pub dist: DistConfig,
     pub server_startup_timeout_ms: Option<u64>,
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
-    pub client_side_mode: bool,
+    pub compile: CompileExecutionConfig,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct FileCompileExecutionConfig {
+    client_side_mode: Option<bool>,
+    serverless: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct FileConfigWire {
+    cache: CacheConfigs,
+    dist: DistConfig,
+    server_startup_timeout_ms: Option<u64>,
+    basedirs: Vec<String>,
+    compile: FileCompileExecutionConfig,
+    client_side_mode: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for FileConfig {
+    fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FileConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            cache: wire.cache,
+            dist: wire.dist,
+            server_startup_timeout_ms: wire.server_startup_timeout_ms,
+            basedirs: wire.basedirs,
+            compile: CompileExecutionConfig {
+                client_side_mode: wire
+                    .compile
+                    .client_side_mode
+                    .or(wire.client_side_mode)
+                    .unwrap_or_default(),
+                serverless: wire.compile.serverless.unwrap_or_default(),
+            },
+        })
+    }
+}
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
 // config exists but doesn't parse then something is wrong - return an error.
 pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -832,11 +902,17 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     Ok(Some(res))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct EnvCompileExecutionConfig {
+    client_side_mode: Option<bool>,
+    serverless: Option<bool>,
+}
+
+#[derive(Debug, Default)]
 pub struct EnvConfig {
     cache: CacheConfigs,
     basedirs: Option<Vec<String>>,
-    client_side_mode: Option<bool>,
+    compile: EnvCompileExecutionConfig,
 }
 
 fn string_from_env_var(env_var_name: &str) -> Option<String> {
@@ -1271,12 +1347,15 @@ fn config_from_env() -> Result<EnvConfig> {
             .collect()
     });
 
-    let client_side_mode = bool_from_env_var("SCCACHE_CLIENT_SIDE")?;
+    let compile = EnvCompileExecutionConfig {
+        client_side_mode: bool_from_env_var("SCCACHE_CLIENT_SIDE")?,
+        serverless: bool_from_env_var("SCCACHE_SERVERLESS")?,
+    };
 
     Ok(EnvConfig {
         cache,
         basedirs,
-        client_side_mode,
+        compile,
     })
 }
 
@@ -1313,7 +1392,7 @@ pub struct Config {
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's CCACHE_BASEDIR.
     pub basedirs: Vec<Vec<u8>>,
-    pub client_side_mode: bool,
+    pub compile: CompileExecutionConfig,
 }
 
 impl Config {
@@ -1336,7 +1415,7 @@ impl Config {
             dist,
             server_startup_timeout_ms,
             basedirs: file_basedirs,
-            client_side_mode: file_client_side_mode,
+            compile: file_compile,
         } = file_conf;
         conf_caches.merge(cache);
 
@@ -1346,7 +1425,7 @@ impl Config {
         let EnvConfig {
             cache,
             basedirs: env_basedirs,
-            client_side_mode: env_client_side_mode,
+            compile: env_compile,
         } = env_conf;
         conf_caches.merge(cache);
 
@@ -1400,16 +1479,16 @@ impl Config {
             debug!("Using basedirs for path normalization: {:?}", basedirs_str);
         }
 
-        let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode)
-            // Logging always writes to stderr in the client process, disregarding
-            // SCCACHE_ERROR_LOG; Even if SCCACHE_ERROR_LOG was handled, there would
-            // be write races from multiple processes. Until those are addressed, we
-            // can't leave the client mode enabled alongside logging.
-            && std::env::var_os(crate::LOGGING_ENV).is_none()
-            // Client-side mode is also not compatible with distributed compilation.
-            && dist.scheduler_url.is_none();
+        let compile = CompileExecutionConfig::resolve(env_compile, file_compile, &dist)?;
+
+        if compile.serverless && conf_caches.multilevel.is_some() {
+            bail!("Serverless mode is not compatible with multi-level caching");
+        }
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
+        if compile.serverless && caches.is_none() && conf_caches.directory.is_none() {
+            bail!("Serverless mode requires the directory cache or a single remote cache backend");
+        }
         Ok(Self {
             cache: caches,
             cache_configs: conf_caches,
@@ -1417,7 +1496,7 @@ impl Config {
             dist,
             server_startup_timeout,
             basedirs,
-            client_side_mode,
+            compile,
         })
     }
 }
@@ -1692,6 +1771,148 @@ fn test_string_from_env_var() {
 }
 
 #[test]
+fn serverless_config_precedence_and_client_side_exclusion() {
+    let config = Config::from_env_and_file_configs(
+        EnvConfig::default(),
+        FileConfig {
+            cache: CacheConfigs {
+                directory: Some(Default::default()),
+                ..Default::default()
+            },
+            compile: CompileExecutionConfig {
+                client_side_mode: true,
+                serverless: true,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(config.compile.serverless);
+    assert!(!config.compile.client_side_mode);
+
+    let config = Config::from_env_and_file_configs(
+        EnvConfig {
+            compile: EnvCompileExecutionConfig {
+                serverless: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        FileConfig {
+            compile: CompileExecutionConfig {
+                serverless: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!config.compile.serverless);
+}
+
+#[test]
+#[serial(config_from_env)]
+fn serverless_env_config() {
+    let serverless = temp_env::with_var("SCCACHE_SERVERLESS", Some("true"), || {
+        config_from_env().unwrap().compile.serverless
+    });
+    assert_eq!(serverless, Some(true));
+}
+
+#[test]
+fn serverless_rejects_distributed_compilation() {
+    let file_config: FileConfig = toml::from_str(
+        r#"
+[compile]
+serverless = true
+
+[dist]
+scheduler_url = "http://127.0.0.1:10600"
+"#,
+    )
+    .unwrap();
+
+    let error = Config::from_env_and_file_configs(EnvConfig::default(), file_config).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Serverless mode is not compatible with distributed compilation")
+    );
+}
+
+#[test]
+fn legacy_client_side_mode_toml_config() {
+    let config: FileConfig = toml::from_str("client_side_mode = true").unwrap();
+    assert!(config.compile.client_side_mode);
+
+    let config: FileConfig = toml::from_str(
+        r#"
+client_side_mode = true
+
+[compile]
+client_side_mode = false
+"#,
+    )
+    .unwrap();
+    assert!(!config.compile.client_side_mode);
+}
+
+#[test]
+fn legacy_client_side_mode_json_config() {
+    let config: FileConfig = serde_json::from_str(r#"{"client_side_mode":true}"#).unwrap();
+    assert!(config.compile.client_side_mode);
+
+    let config: FileConfig =
+        serde_json::from_str(r#"{"client_side_mode":true,"compile":{"client_side_mode":false}}"#)
+            .unwrap();
+    assert!(!config.compile.client_side_mode);
+}
+
+#[test]
+fn serverless_rejects_default_disk_cache() {
+    let error = Config::from_env_and_file_configs(
+        EnvConfig::default(),
+        FileConfig {
+            compile: CompileExecutionConfig {
+                serverless: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Serverless mode requires the directory cache or a single remote cache")
+    );
+}
+
+#[test]
+fn serverless_rejects_multilevel_cache() {
+    let file_config: FileConfig = toml::from_str(
+        r#"
+[compile]
+serverless = true
+
+[cache.directory]
+
+[cache.multilevel]
+chain = ["directory"]
+"#,
+    )
+    .unwrap();
+
+    let error = Config::from_env_and_file_configs(EnvConfig::default(), file_config).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Serverless mode is not compatible with multi-level caching")
+    );
+}
+
+#[test]
 fn config_overrides() {
     let env_conf = EnvConfig {
         cache: CacheConfigs {
@@ -1719,7 +1940,7 @@ fn config_overrides() {
             ..Default::default()
         },
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1747,7 +1968,7 @@ fn config_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     assert_eq!(
@@ -1801,7 +2022,7 @@ fn config_overrides() {
             dist: Default::default(),
             server_startup_timeout: None,
             basedirs: vec![],
-            client_side_mode: false,
+            compile: Default::default(),
         }
     );
 }
@@ -1813,7 +2034,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec!["C:/env/basedir".to_string()].into(),
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1821,7 +2042,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1831,7 +2052,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1839,7 +2060,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1849,7 +2070,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1857,7 +2078,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1867,7 +2088,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1875,7 +2096,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1889,7 +2110,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec!["/env/basedir".to_string()].into(),
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1897,7 +2118,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1907,7 +2128,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1915,7 +2136,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1925,7 +2146,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1933,7 +2154,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1943,7 +2164,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1951,7 +2172,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1959,7 +2180,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1967,7 +2188,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2217,7 +2438,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
-        client_side_mode: false,
+        compile: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2252,7 +2473,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
-        client_side_mode: false,
+        compile: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2646,7 +2867,7 @@ key_prefix = "cosprefix"
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
-            client_side_mode: false,
+            compile: Default::default(),
         }
     );
 }
@@ -2740,7 +2961,7 @@ size = "7g"
             },
             server_startup_timeout_ms: None,
             basedirs: vec![],
-            client_side_mode: false,
+            compile: Default::default(),
         }
     );
 }
@@ -2757,7 +2978,7 @@ fn test_integration_config_normalizes_and_strips() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2765,7 +2986,7 @@ fn test_integration_config_normalizes_and_strips() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2792,7 +3013,7 @@ fn test_integration_normalized_path_with_double_slashes() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2800,7 +3021,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2823,7 +3044,7 @@ fn test_integration_windows_path_normalization() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2831,7 +3052,7 @@ fn test_integration_windows_path_normalization() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2855,7 +3076,7 @@ fn test_integration_cow_borrowed_when_no_match() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2863,7 +3084,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2887,7 +3108,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2895,7 +3116,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2918,7 +3139,7 @@ fn test_integration_multiple_basedirs_longest_match() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2926,7 +3147,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2954,7 +3175,7 @@ fn test_integration_paths_with_dots_normalized() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2962,7 +3183,7 @@ fn test_integration_paths_with_dots_normalized() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2986,7 +3207,7 @@ fn test_integration_windows_mixed_slashes() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
-        client_side_mode: None,
+        compile: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2994,7 +3215,7 @@ fn test_integration_windows_mixed_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
-        client_side_mode: false,
+        compile: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();

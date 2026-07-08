@@ -22,23 +22,23 @@ use crate::cache::{Cache, CacheMode, CacheRead, CacheWrite, DecompressionFailure
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::PreprocessorCacheModeConfig;
 use crate::errors::*;
-use crate::lru_disk_cache::ReadSeek;
+use crate::lru_disk_cache::{LruDiskCache, ReadSeek};
 use async_trait::async_trait;
 use bytes::Bytes;
 use filetime::{FileTime, set_file_times};
 use fs_err as fs;
+use fs2::FileExt;
 use std::ffi::OsStr;
-use std::io::{self, BufWriter, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::Builder as TempBuilder;
 use walkdir::WalkDir;
 use zip::{CompressionMethod, ZipArchive};
 
-use super::lazy_disk_cache::LazyDiskCache;
 use super::utils::{normalize_key, set_file_mode};
 
+const CACHE_LOCK_FILE: &str = ".sccache.lock";
 const TEMP_ENTRY_PREFIX: &str = ".sccachetmp";
 const TEMP_ENTRY_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
@@ -51,8 +51,6 @@ pub struct DirectoryCache {
     max_size: u64,
     pool: tokio::runtime::Handle,
     preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
-    preprocessor_cache: Arc<Mutex<LazyDiskCache>>,
-    operation_lock: Arc<Mutex<()>>,
     rw_mode: CacheMode,
     basedirs: Vec<Vec<u8>>,
 }
@@ -86,11 +84,6 @@ impl DirectoryCache {
         basedirs: Vec<Vec<u8>>,
     ) -> DirectoryCache {
         DirectoryCache {
-            preprocessor_cache: Arc::new(Mutex::new(LazyDiskCache::Uninit {
-                root: root.join("preprocessor").into_os_string(),
-                max_size,
-            })),
-            operation_lock: Arc::new(Mutex::new(())),
             root,
             max_size,
             pool: pool.clone(),
@@ -99,6 +92,114 @@ impl DirectoryCache {
             basedirs,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum CacheLockMode {
+    Shared,
+    Exclusive,
+}
+
+struct CacheLock {
+    file: std::fs::File,
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn lock_cache_file(file: std::fs::File, path: &Path, mode: CacheLockMode) -> Result<CacheLock> {
+    match mode {
+        CacheLockMode::Shared => FileExt::lock_shared(&file),
+        CacheLockMode::Exclusive => FileExt::lock_exclusive(&file),
+    }
+    .with_context(|| format!("Failed to lock directory cache {}", path.display()))?;
+    Ok(CacheLock { file })
+}
+
+fn acquire_shared_cache_lock(root: &Path, create_if_missing: bool) -> Result<Option<CacheLock>> {
+    if !ensure_plain_directory(root, false)? {
+        return Ok(None);
+    }
+
+    let path = root.join(CACHE_LOCK_FILE);
+    let file = match open_cache_lock_file(&path, false) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound && !create_if_missing => {
+            // Read-only legacy caches may predate the lock file. They cannot
+            // participate in write coordination, but cache reads still pin all
+            // source files before returning.
+            return Ok(None);
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => open_cache_lock_file(&path, true)
+            .with_context(|| format!("Failed to create directory cache lock {}", path.display()))?,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("Failed to open directory cache lock {}", path.display())
+            });
+        }
+    };
+
+    Ok(Some(lock_cache_file(file, &path, CacheLockMode::Shared)?))
+}
+
+fn acquire_exclusive_cache_lock(root: &Path) -> Result<CacheLock> {
+    ensure_plain_directory(root, true)?;
+    let path = root.join(CACHE_LOCK_FILE);
+    let file = open_cache_lock_file(&path, true)
+        .with_context(|| format!("Failed to open directory cache lock {}", path.display()))?;
+    lock_cache_file(file, &path, CacheLockMode::Exclusive)
+}
+
+#[cfg(unix)]
+fn open_cache_lock_file(path: &Path, create: bool) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    if create {
+        options.write(true).create(true);
+    }
+    let file = options.custom_flags(libc::O_NOFOLLOW).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory cache lock is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_cache_lock_file(path: &Path, create: bool) -> io::Result<std::fs::File> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "directory cache lock is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound && create => {}
+        Err(err) => return Err(err),
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    if create {
+        options.write(true).create(true);
+    }
+    let file = options.open(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory cache lock is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 fn make_key_path(key: &str) -> Result<PathBuf> {
@@ -529,43 +630,51 @@ fn write_raw_entry_contents(path: &Path, data: &[u8], max_size: u64) -> Result<(
     Ok(())
 }
 
-fn commit_entry(root: &Path, max_size: u64, key: &str, entry: CacheWrite) -> Result<Duration> {
-    let start = Instant::now();
-    let relative = make_key_path(key)?;
-    let parent = relative
-        .parent()
-        .ok_or_else(|| anyhow!("Directory cache target without parent"))?;
-    ensure_relative_directory(root, parent, true)?
-        .ok_or_else(|| anyhow!("Failed to create directory cache target parent"))?;
-    clean_temporary_entries(root);
-
-    let target = root.join(&relative);
-    let tempdir = TempBuilder::new()
-        .prefix(TEMP_ENTRY_PREFIX)
-        .tempdir_in(root)
-        .context("Failed to create temporary directory cache entry")?;
-    write_entry_contents(tempdir.path(), &entry)?;
-    let new_size = directory_size(tempdir.path())?;
-    make_space(root, max_size, new_size, &target)?;
-
-    if ensure_relative_directory(root, &relative, false)?.is_some() {
-        fs::remove_dir_all(&target)
-            .with_context(|| format!("Failed to replace cache entry {}", target.display()))?;
-    }
-
-    let temp_path = tempdir.into_path();
-    if let Err(err) = fs::rename(&temp_path, &target) {
-        let _ = fs::remove_dir_all(&temp_path);
-        return Err(err)
-            .with_context(|| format!("Failed to commit cache entry {}", target.display()));
-    }
-
-    Ok(start.elapsed())
+struct PreparedEntry {
+    tempdir: tempfile::TempDir,
+    size: u64,
 }
 
-fn commit_raw_entry(root: &Path, max_size: u64, key: &str, data: Bytes) -> Result<Duration> {
-    let start = Instant::now();
-    let relative = make_key_path(key)?;
+fn prepare_entry(root: &Path, entry: &CacheWrite) -> Result<PreparedEntry> {
+    ensure_plain_directory(root, true)?;
+    let tempdir = TempBuilder::new()
+        .prefix(TEMP_ENTRY_PREFIX)
+        .tempdir_in(root)
+        .context("Failed to create temporary directory cache entry")?;
+    write_entry_contents(tempdir.path(), entry)?;
+    let size = directory_size(tempdir.path())?;
+    Ok(PreparedEntry { tempdir, size })
+}
+
+fn prepare_raw_entry(root: &Path, data: &[u8], max_size: u64) -> Result<PreparedEntry> {
+    ensure_plain_directory(root, true)?;
+    let tempdir = TempBuilder::new()
+        .prefix(TEMP_ENTRY_PREFIX)
+        .tempdir_in(root)
+        .context("Failed to create temporary directory cache entry")?;
+    write_raw_entry_contents(tempdir.path(), data, max_size)?;
+    let size = directory_size(tempdir.path())?;
+    Ok(PreparedEntry { tempdir, size })
+}
+
+#[derive(Clone, Copy)]
+enum PublishMode {
+    Replace,
+    IfAbsent,
+}
+
+fn publish_entry(
+    root: &Path,
+    max_size: u64,
+    relative: &Path,
+    prepared: PreparedEntry,
+    mode: PublishMode,
+) -> Result<bool> {
+    let target_exists = ensure_relative_directory(root, relative, false)?.is_some();
+    if target_exists && matches!(mode, PublishMode::IfAbsent) {
+        return Ok(false);
+    }
+
     let parent = relative
         .parent()
         .ok_or_else(|| anyhow!("Directory cache target without parent"))?;
@@ -573,28 +682,71 @@ fn commit_raw_entry(root: &Path, max_size: u64, key: &str, data: Bytes) -> Resul
         .ok_or_else(|| anyhow!("Failed to create directory cache target parent"))?;
     clean_temporary_entries(root);
 
-    let target = root.join(&relative);
-    let tempdir = TempBuilder::new()
-        .prefix(TEMP_ENTRY_PREFIX)
-        .tempdir_in(root)
-        .context("Failed to create temporary directory cache entry")?;
-    write_raw_entry_contents(tempdir.path(), &data, max_size)?;
-    let new_size = directory_size(tempdir.path())?;
-    make_space(root, max_size, new_size, &target)?;
-
-    if ensure_relative_directory(root, &relative, false)?.is_some() {
+    let target = root.join(relative);
+    make_space(root, max_size, prepared.size, &target)?;
+    if target_exists {
         fs::remove_dir_all(&target)
             .with_context(|| format!("Failed to replace cache entry {}", target.display()))?;
     }
 
-    let temp_path = tempdir.into_path();
+    let temp_path = prepared.tempdir.into_path();
     if let Err(err) = fs::rename(&temp_path, &target) {
         let _ = fs::remove_dir_all(&temp_path);
         return Err(err)
             .with_context(|| format!("Failed to commit cache entry {}", target.display()));
     }
 
-    Ok(start.elapsed())
+    Ok(true)
+}
+
+impl DirectoryCache {
+    async fn put_entry(
+        &self,
+        key: &str,
+        entry: CacheWrite,
+        mode: PublishMode,
+    ) -> Result<(Duration, bool)> {
+        if self.rw_mode == CacheMode::ReadOnly {
+            bail!("Cannot write to a read-only cache");
+        }
+
+        let root = self.root.clone();
+        let max_size = self.max_size;
+        let relative = make_key_path(key)?;
+        self.pool
+            .spawn_blocking(move || {
+                let start = Instant::now();
+                let prepared = prepare_entry(&root, &entry)?;
+                let _lock = acquire_exclusive_cache_lock(&root)?;
+                let inserted = publish_entry(&root, max_size, &relative, prepared, mode)?;
+                Ok((start.elapsed(), inserted))
+            })
+            .await?
+    }
+
+    async fn put_raw_entry(
+        &self,
+        key: &str,
+        data: Bytes,
+        mode: PublishMode,
+    ) -> Result<(Duration, bool)> {
+        if self.rw_mode == CacheMode::ReadOnly {
+            bail!("Cannot write to a read-only cache");
+        }
+
+        let root = self.root.clone();
+        let max_size = self.max_size;
+        let relative = make_key_path(key)?;
+        self.pool
+            .spawn_blocking(move || {
+                let start = Instant::now();
+                let prepared = prepare_raw_entry(&root, &data, max_size)?;
+                let _lock = acquire_exclusive_cache_lock(&root)?;
+                let inserted = publish_entry(&root, max_size, &relative, prepared, mode)?;
+                Ok((start.elapsed(), inserted))
+            })
+            .await?
+    }
 }
 
 #[async_trait]
@@ -604,38 +756,28 @@ impl Storage for DirectoryCache {
         let root = self.root.clone();
         let relative = make_key_path(key)?;
         let max_size = self.max_size;
-        let operation_lock = Arc::clone(&self.operation_lock);
+        let create_lock = self.rw_mode == CacheMode::ReadWrite;
         self.pool
             .spawn_blocking(move || {
-                let _guard = operation_lock.lock().unwrap();
+                let _lock = acquire_shared_cache_lock(&root, create_lock)?;
                 let Some(path) = ensure_relative_directory(&root, &relative, false)? else {
                     return Ok(Cache::Miss);
                 };
+                let read = CacheRead::from_directory_with_max_size(path.clone(), Some(max_size))?;
                 touch_entry(&path);
-                Ok(Cache::Hit(CacheRead::from_directory_with_max_size(
-                    path,
-                    Some(max_size),
-                )?))
+                Ok(Cache::Hit(read))
             })
             .await?
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         trace!("DirectoryCache::put({})", key);
-        if self.rw_mode == CacheMode::ReadOnly {
-            bail!("Cannot write to a read-only cache");
-        }
+        Ok(self.put_entry(key, entry, PublishMode::Replace).await?.0)
+    }
 
-        let root = self.root.clone();
-        let max_size = self.max_size;
-        let key = key.to_owned();
-        let operation_lock = Arc::clone(&self.operation_lock);
-        self.pool
-            .spawn_blocking(move || {
-                let _guard = operation_lock.lock().unwrap();
-                commit_entry(&root, max_size, &key, entry)
-            })
-            .await?
+    async fn put_if_absent(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
+        trace!("DirectoryCache::put_if_absent({})", key);
+        Ok(self.put_entry(key, entry, PublishMode::IfAbsent).await?.0)
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
@@ -643,15 +785,18 @@ impl Storage for DirectoryCache {
         let root = self.root.clone();
         let relative = make_key_path(key)?;
         let max_size = self.max_size;
-        let operation_lock = Arc::clone(&self.operation_lock);
+        let create_lock = self.rw_mode == CacheMode::ReadWrite;
         self.pool
             .spawn_blocking(move || {
-                let _guard = operation_lock.lock().unwrap();
-                let Some(path) = ensure_relative_directory(&root, &relative, false)? else {
-                    return Ok(None);
+                let entry = {
+                    let _lock = acquire_shared_cache_lock(&root, create_lock)?;
+                    let Some(path) = ensure_relative_directory(&root, &relative, false)? else {
+                        return Ok(None);
+                    };
+                    let entry = read_entry_as_cache_write(&path, max_size)?;
+                    touch_entry(&path);
+                    entry
                 };
-                touch_entry(&path);
-                let entry = read_entry_as_cache_write(&path, max_size)?;
                 Ok(Some(Bytes::from(entry.finish()?)))
             })
             .await?
@@ -659,22 +804,8 @@ impl Storage for DirectoryCache {
 
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
         trace!("DirectoryCache::put_raw({}, {} bytes)", key, data.len());
-        if self.rw_mode == CacheMode::ReadOnly {
-            bail!("Cannot write to a read-only cache");
-        }
-
-        let root = self.root.clone();
-        let max_size = self.max_size;
-        let key = key.to_owned();
-        let operation_lock = Arc::clone(&self.operation_lock);
-        self.pool
-            .spawn_blocking(move || {
-                let _guard = operation_lock.lock().unwrap();
-                commit_raw_entry(&root, max_size, &key, data)
-            })
-            .await?
+        Ok(self.put_raw_entry(key, data, PublishMode::Replace).await?.0)
     }
-
     async fn check(&self) -> Result<CacheMode> {
         Ok(self.rw_mode)
     }
@@ -689,13 +820,9 @@ impl Storage for DirectoryCache {
 
     async fn current_size(&self) -> Result<Option<u64>> {
         let root = self.root.clone();
-        let operation_lock = Arc::clone(&self.operation_lock);
         self.pool
             .spawn_blocking(move || {
-                let _guard = operation_lock.lock().unwrap();
-                if !ensure_plain_directory(&root, false)? {
-                    return Ok(Some(0));
-                }
+                let _lock = acquire_exclusive_cache_lock(&root)?;
                 clean_temporary_entries(&root);
                 Ok(Some(
                     scan_entries(&root)?
@@ -720,15 +847,16 @@ impl Storage for DirectoryCache {
     }
 
     async fn get_preprocessor_cache_entry(&self, key: &str) -> Result<Option<Box<dyn ReadSeek>>> {
-        ensure_plain_directory(&self.root, true)?;
+        let root = self.root.clone();
+        let max_size = self.max_size;
         let key = normalize_key(key);
-        Ok(self
-            .preprocessor_cache
-            .lock()
-            .unwrap()
-            .get_or_init()?
-            .get(key)
-            .ok())
+        self.pool
+            .spawn_blocking(move || {
+                let _lock = acquire_exclusive_cache_lock(&root)?;
+                let mut cache = LruDiskCache::new(root.join("preprocessor"), max_size)?;
+                Ok(cache.get(key).ok())
+            })
+            .await?
     }
 
     async fn put_preprocessor_cache_entry(
@@ -740,22 +868,21 @@ impl Storage for DirectoryCache {
             bail!("Cannot write to a read-only cache");
         }
 
-        ensure_plain_directory(&self.root, true)?;
+        let mut serialized = Vec::new();
+        preprocessor_cache_entry.serialize_to(&mut serialized)?;
+
+        let root = self.root.clone();
+        let max_size = self.max_size;
         let key = normalize_key(key);
-        let mut f = self
-            .preprocessor_cache
-            .lock()
-            .unwrap()
-            .get_or_init()?
-            .prepare_add(key, 0)?;
-        preprocessor_cache_entry.serialize_to(BufWriter::new(f.as_file_mut()))?;
-        Ok(self
-            .preprocessor_cache
-            .lock()
-            .unwrap()
-            .get()
-            .unwrap()
-            .commit(f)?)
+        self.pool
+            .spawn_blocking(move || {
+                let _lock = acquire_exclusive_cache_lock(&root)?;
+                let mut cache = LruDiskCache::new(root.join("preprocessor"), max_size)?;
+                let mut entry = cache.prepare_add(key, serialized.len() as u64)?;
+                entry.as_file_mut().write_all(&serialized)?;
+                Ok(cache.commit(entry)?)
+            })
+            .await?
     }
 }
 
@@ -764,9 +891,14 @@ mod tests {
     use super::*;
     use crate::cache::FileObjectSource;
     use bytes::Bytes;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     const KEY: &str = "abcdef0123456789";
+    const OTHER_KEY: &str = "abcdef0123456788";
 
     fn new_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -786,6 +918,175 @@ mod tests {
         )
     }
 
+    fn cache_write_with_object(object: &[u8]) -> CacheWrite {
+        let mut write = CacheWrite::new();
+        write
+            .put_object("o", &mut Cursor::new(object), None)
+            .unwrap();
+        write
+    }
+
+    fn raw_cache_entry(object: &[u8]) -> Bytes {
+        Bytes::from(cache_write_with_object(object).finish().unwrap())
+    }
+
+    fn spawn_put(
+        root: PathBuf,
+        barrier: Arc<Barrier>,
+        key: &'static str,
+        object: &'static [u8],
+    ) -> thread::JoinHandle<bool> {
+        thread::spawn(move || {
+            let runtime = new_runtime();
+            let cache = new_cache(root, runtime.handle());
+            let write = cache_write_with_object(object);
+            barrier.wait();
+            runtime
+                .block_on(cache.put_entry(key, write, PublishMode::IfAbsent))
+                .unwrap()
+                .1
+        })
+    }
+
+    fn read_cached_object(
+        runtime: &tokio::runtime::Runtime,
+        cache: &DirectoryCache,
+        key: &str,
+    ) -> Vec<u8> {
+        let mut read = match runtime.block_on(cache.get(key)).unwrap() {
+            Cache::Hit(read) => read,
+            other => panic!("expected cache hit, got {other:?}"),
+        };
+        let mut object = Vec::new();
+        read.get_object("o", &mut object).unwrap();
+        object
+    }
+
+    #[test]
+    fn directory_cache_miss_does_not_create_root() {
+        let runtime = new_runtime();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let cache = new_cache(cache_root.clone(), runtime.handle());
+
+        assert!(matches!(
+            runtime.block_on(cache.get(KEY)).unwrap(),
+            Cache::Miss
+        ));
+        assert!(!cache_root.exists());
+    }
+
+    #[test]
+    fn directory_cache_independent_instances_write_distinct_keys_concurrently() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first = spawn_put(
+            cache_root.clone(),
+            Arc::clone(&barrier),
+            KEY,
+            b"first object",
+        );
+        let second = spawn_put(
+            cache_root.clone(),
+            Arc::clone(&barrier),
+            OTHER_KEY,
+            b"second object",
+        );
+        assert!(first.join().unwrap());
+        assert!(second.join().unwrap());
+
+        let runtime = new_runtime();
+        let cache = new_cache(cache_root, runtime.handle());
+        assert_eq!(read_cached_object(&runtime, &cache, KEY), b"first object");
+        assert_eq!(
+            read_cached_object(&runtime, &cache, OTHER_KEY),
+            b"second object"
+        );
+    }
+
+    #[test]
+    fn directory_cache_independent_instances_choose_one_same_key_winner() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first = spawn_put(
+            cache_root.clone(),
+            Arc::clone(&barrier),
+            KEY,
+            b"first contender",
+        );
+        let second = spawn_put(
+            cache_root.clone(),
+            Arc::clone(&barrier),
+            KEY,
+            b"second contender",
+        );
+        let first_inserted = first.join().unwrap();
+        let second_inserted = second.join().unwrap();
+        assert_ne!(
+            first_inserted, second_inserted,
+            "exactly one same-key publication should win"
+        );
+
+        let winner: &[u8] = if first_inserted {
+            b"first contender"
+        } else {
+            b"second contender"
+        };
+        let loser: &[u8] = if first_inserted {
+            b"second contender"
+        } else {
+            b"first contender"
+        };
+
+        let runtime = new_runtime();
+        let cache = new_cache(cache_root, runtime.handle());
+        let mut pinned = match runtime.block_on(cache.get(KEY)).unwrap() {
+            Cache::Hit(read) => read,
+            other => panic!("expected cache hit, got {other:?}"),
+        };
+
+        runtime
+            .block_on(cache.put(KEY, cache_write_with_object(loser)))
+            .unwrap();
+
+        let mut pinned_object = Vec::new();
+        pinned.get_object("o", &mut pinned_object).unwrap();
+        assert_eq!(pinned_object, winner);
+        assert_eq!(read_cached_object(&runtime, &cache, KEY), loser);
+    }
+
+    #[test]
+    fn directory_cache_preprocessor_cache_reloads_from_disk_each_operation() {
+        let runtime = new_runtime();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let writer = new_cache(cache_root.clone(), runtime.handle());
+        let reader = new_cache(cache_root, runtime.handle());
+
+        assert!(
+            runtime
+                .block_on(reader.get_preprocessor_cache_entry(KEY))
+                .unwrap()
+                .is_none()
+        );
+
+        let expected = PreprocessorCacheEntry::default();
+        runtime
+            .block_on(writer.put_preprocessor_cache_entry(KEY, expected.clone()))
+            .unwrap();
+
+        let mut stored = runtime
+            .block_on(reader.get_preprocessor_cache_entry(KEY))
+            .unwrap()
+            .expect("preprocessor cache entry should be visible");
+        let mut serialized = Vec::new();
+        stored.read_to_end(&mut serialized).unwrap();
+        assert_eq!(PreprocessorCacheEntry::read(&serialized).unwrap(), expected);
+    }
     #[test]
     fn directory_cache_stores_and_restores_raw_objects() {
         let runtime = new_runtime();
@@ -908,6 +1209,26 @@ mod tests {
     }
 
     #[test]
+    fn directory_cache_put_raw_replaces_existing_entry() {
+        let runtime = new_runtime();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache = new_cache(tempdir.path().join("cache"), runtime.handle());
+
+        runtime
+            .block_on(cache.put_raw(KEY, raw_cache_entry(b"first object")))
+            .unwrap();
+        runtime
+            .block_on(cache.put_raw(KEY, raw_cache_entry(b"second object")))
+            .unwrap();
+
+        let raw = runtime.block_on(cache.get_raw(KEY)).unwrap().unwrap();
+        let mut read = CacheRead::from(Cursor::new(raw.to_vec())).unwrap();
+        let mut object = Vec::new();
+        read.get_object("o", &mut object).unwrap();
+        assert_eq!(object, b"second object");
+    }
+
+    #[test]
     fn directory_cache_get_raw_refreshes_lru_timestamp() {
         let runtime = new_runtime();
         let pool = runtime.handle().clone();
@@ -1013,6 +1334,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read(output).unwrap(), b"pinned object");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_cache_reads_existing_and_legacy_read_only_roots() {
+        let runtime = new_runtime();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let writer = new_cache(cache_root.clone(), runtime.handle());
+        runtime
+            .block_on(writer.put(KEY, cache_write_with_object(b"read-only object")))
+            .unwrap();
+
+        let lock_path = cache_root.join(CACHE_LOCK_FILE);
+        let mut permissions = fs::metadata(&lock_path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        fs::set_permissions(&lock_path, permissions).unwrap();
+        let mut permissions = fs::metadata(&cache_root).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&cache_root, permissions).unwrap();
+
+        let reader = DirectoryCache::new_at_path(
+            cache_root.clone(),
+            u64::MAX,
+            runtime.handle(),
+            PreprocessorCacheModeConfig::default(),
+            CacheMode::ReadOnly,
+            vec![],
+        );
+        assert_eq!(
+            read_cached_object(&runtime, &reader, KEY),
+            b"read-only object"
+        );
+
+        let mut permissions = fs::metadata(&cache_root).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cache_root, permissions).unwrap();
+        fs::remove_file(&lock_path).unwrap();
+        let mut permissions = fs::metadata(&cache_root).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&cache_root, permissions).unwrap();
+
+        assert_eq!(
+            read_cached_object(&runtime, &reader, KEY),
+            b"read-only object"
+        );
+        assert!(!lock_path.exists());
+
+        let mut permissions = fs::metadata(&cache_root).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cache_root, permissions).unwrap();
     }
 
     #[test]

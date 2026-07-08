@@ -13,6 +13,7 @@ use std::{
         prelude::{OsStrExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
 };
 
 struct StopServer;
@@ -71,6 +72,132 @@ fn test_symlinks() {
     assert_ne!(output1, output2);
 }
 
+#[test]
+fn test_serverless_directory_cache() {
+    let root = tempdir().unwrap();
+    let root = root.path();
+    let compiler_dir = root.join("rust");
+    create_mock_rustc(compiler_dir.clone());
+
+    let cache_dir = root.join("sccache");
+    let barrier_dir = root.join("barrier");
+    let server_socket = root.join("server.sock");
+    create_dir(&barrier_dir).unwrap();
+
+    let build_a = root.join("build-a");
+    let build_b = root.join("build-b");
+    for build_dir in [&build_a, &build_b] {
+        create_dir(build_dir).unwrap();
+        fs::write(build_dir.join("counter"), b"0").unwrap();
+        fs::write(build_dir.join("RUST_FILE.rs"), []).unwrap();
+    }
+
+    let compiler_bin = compiler_dir.join("bin");
+    let mut command_a = serverless_sccache_command(
+        &build_a,
+        &compiler_bin,
+        &cache_dir,
+        &barrier_dir,
+        &server_socket,
+        "a",
+    );
+    let mut command_b = serverless_sccache_command(
+        &build_b,
+        &compiler_bin,
+        &cache_dir,
+        &barrier_dir,
+        &server_socket,
+        "b",
+    );
+    let child_a = command_a
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child_b = command_b
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    for (name, output) in [
+        ("a", child_a.wait_with_output().unwrap()),
+        ("b", child_b.wait_with_output().unwrap()),
+    ] {
+        assert!(
+            output.status.success(),
+            "serverless compile {name} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    assert_eq!(fs::read(build_a.join("counter")).unwrap(), b"1\n");
+    assert_eq!(fs::read(build_b.join("counter")).unwrap(), b"1\n");
+
+    remove_file(build_a.join("RUST_FILE")).unwrap();
+    let output = serverless_sccache_command(
+        &build_a,
+        &compiler_bin,
+        &cache_dir,
+        &barrier_dir,
+        &server_socket,
+        "a",
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "serverless cache-hit compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(fs::read(build_a.join("counter")).unwrap(), b"1\n");
+    assert!(build_a.join("RUST_FILE").is_file());
+    assert!(
+        !server_socket.exists(),
+        "serverless compilation started a daemon"
+    );
+}
+
+fn serverless_sccache_command(
+    root: &Path,
+    compiler_bin: &Path,
+    cache_dir: &Path,
+    barrier_dir: &Path,
+    server_socket: &Path,
+    build_id: &str,
+) -> ProcessCommand {
+    let mut paths: OsString = compiler_bin.into();
+    paths.push(":");
+    paths.push(var_os("PATH").unwrap());
+
+    let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_sccache"));
+    for (var, _) in std::env::vars_os() {
+        if var.to_string_lossy().starts_with("SCCACHE_") {
+            command.env_remove(var);
+        }
+    }
+    command
+        .current_dir(root)
+        .env("PATH", paths)
+        .env("SCCACHE_CONF", root.join("missing-config"))
+        .env("SCCACHE_SERVERLESS", "true")
+        .env("SCCACHE_DIRECTORY_DIR", cache_dir)
+        .env("SCCACHE_DIRECTORY_DIRECT", "false")
+        .env("SCCACHE_SERVER_UDS", server_socket)
+        .env("SCCACHE_TEST_BARRIER_DIR", barrier_dir)
+        .env("SCCACHE_TEST_BUILD_ID", build_id)
+        .arg("rustc")
+        .arg("RUST_FILE.rs")
+        .arg("--crate-name=sccache_rustc_tests")
+        .arg("--crate-type=lib")
+        .arg("--emit=link")
+        .arg("--out-dir")
+        .arg(root);
+    command
+}
+
 fn create_mock_rustc(dir: PathBuf) {
     let bin = dir.join("bin");
     create_dir_all(&bin).unwrap();
@@ -106,6 +233,9 @@ while [ "$#" -gt 0 ]; do
         --print)
             shift
             if [ "$1" = file-names ]; then
+                if [ -n "$SCCACHE_TEST_BARRIER_DIR" ]; then
+                    exec echo RUST_FILE
+                fi
                 exec echo RUST_FILE.rs
             fi
             ;;
@@ -124,6 +254,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$build" -eq 1 ]; then
+    if [ -n "$SCCACHE_TEST_BARRIER_DIR" ]; then
+        touch "$SCCACHE_TEST_BARRIER_DIR/ready-$SCCACHE_TEST_BUILD_ID"
+        waited=0
+        while [ ! -f "$SCCACHE_TEST_BARRIER_DIR/ready-a" ] || [ ! -f "$SCCACHE_TEST_BARRIER_DIR/ready-b" ]; do
+            waited=$((waited + 1))
+            if [ "$waited" -ge 200 ]; then
+                exit 88
+            fi
+            sleep 0.05
+        done
+    fi
     echo $(($(cat counter) + 1)) > counter
     cp counter RUST_FILE
 fi
