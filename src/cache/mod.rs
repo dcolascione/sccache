@@ -19,6 +19,8 @@ pub mod cache;
 pub mod cache_io;
 #[cfg(feature = "cos")]
 pub mod cos;
+pub mod directory;
+pub(crate) mod directory_io;
 pub mod disk;
 #[cfg(feature = "gcs")]
 pub mod gcs;

@@ -16,8 +16,8 @@ use super::*;
 use crate::cache::CacheRead;
 use crate::cache::disk::DiskCache;
 use crate::cache::readonly::ReadOnlyStorage;
-use crate::config::Config;
 use crate::config::PreprocessorCacheModeConfig;
+use crate::config::{CacheConfigs, Config, DiskCacheConfig, MultiLevelConfig};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::env;
@@ -513,6 +513,32 @@ fn test_remote_to_remote_backfill() {
     });
 }
 
+#[test]
+fn test_config_directory_level() {
+    let runtime = RuntimeBuilder::new_current_thread().build().unwrap();
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_configs: CacheConfigs {
+            directory: Some(DiskCacheConfig {
+                dir: tempdir.path().to_owned(),
+                ..Default::default()
+            }),
+            multilevel: Some(MultiLevelConfig {
+                chain: vec!["directory".to_owned()],
+                write_error_policy: WriteErrorPolicy::L0,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let storage = MultiLevelStorage::from_config(&config, runtime.handle())
+        .unwrap()
+        .expect("directory level should be configured");
+
+    assert_eq!(storage.levels.len(), 1);
+    assert_eq!(storage.levels[0].cache_type_name(), "directory");
+}
 #[test]
 #[serial_test::serial(multilevel_env)]
 fn test_config_validation_invalid_level_name() {

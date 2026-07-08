@@ -510,6 +510,7 @@ pub enum CacheType {
 pub struct CacheConfigs {
     pub azure: Option<AzureCacheConfig>,
     pub disk: Option<DiskCacheConfig>,
+    pub directory: Option<DiskCacheConfig>,
     pub gcs: Option<GCSCacheConfig>,
     pub gha: Option<GHACacheConfig>,
     pub memcached: Option<MemcachedCacheConfig>,
@@ -529,6 +530,7 @@ impl CacheConfigs {
         let CacheConfigs {
             azure,
             disk,
+            directory: _,
             gcs,
             gha,
             memcached,
@@ -596,8 +598,11 @@ impl CacheConfigs {
                         anyhow!("OSS cache not configured but specified in levels")
                     })?,
                     "disk" => {
-                        // Disk cache is handled separately in MultiLevelStorage::from_config
-                        // Mark it by continuing - it will be added to the storage list there
+                        // Disk cache is handled separately in MultiLevelStorage::from_config.
+                        continue;
+                    }
+                    "directory" => {
+                        // Directory cache is handled separately in MultiLevelStorage::from_config.
                         continue;
                     }
                     _ => bail!("Unknown cache level: {}", level_name),
@@ -617,6 +622,7 @@ impl CacheConfigs {
         let CacheConfigs {
             azure,
             disk,
+            directory,
             gcs,
             gha,
             memcached,
@@ -633,6 +639,9 @@ impl CacheConfigs {
         }
         if disk.is_some() {
             self.disk = disk;
+        }
+        if directory.is_some() {
+            self.directory = directory;
         }
         if gcs.is_some() {
             self.gcs = gcs;
@@ -1170,10 +1179,47 @@ fn config_from_env() -> Result<EnvConfig> {
         || disk_rw_mode_overridden;
     let disk = if any_overridden {
         Some(DiskCacheConfig {
-            dir: disk_dir.unwrap_or_else(default_disk_cache_dir),
+            dir: disk_dir.clone().unwrap_or_else(default_disk_cache_dir),
             size: disk_sz.unwrap_or_else(default_disk_cache_size),
             preprocessor_cache_mode: preprocessor_mode_config,
             rw_mode: disk_rw_mode,
+        })
+    } else {
+        None
+    };
+
+    // ======= Directory local cache =======
+    let directory_dir = env::var_os("SCCACHE_DIRECTORY_DIR").map(PathBuf::from);
+    let directory_sz =
+        string_from_env_var("SCCACHE_DIRECTORY_CACHE_SIZE").and_then(|v| parse_size(&v));
+
+    let mut directory_preprocessor_mode_config = PreprocessorCacheModeConfig::activated();
+    let directory_preprocessor_mode_overridden =
+        if let Some(value) = bool_from_env_var("SCCACHE_DIRECTORY_DIRECT")? {
+            directory_preprocessor_mode_config.use_preprocessor_cache_mode = value;
+            true
+        } else {
+            false
+        };
+
+    let (directory_rw_mode, directory_rw_mode_overridden) =
+        match cache_mode_from_env_var("SCCACHE_DIRECTORY_RW_MODE") {
+            Some(mode) => (mode, true),
+            _ => (CacheModeConfig::ReadWrite, false),
+        };
+
+    let directory_any_overridden = directory_dir.is_some()
+        || directory_sz.is_some()
+        || directory_preprocessor_mode_overridden
+        || directory_rw_mode_overridden;
+    let default_env_directory_cache_dir =
+        || disk_dir.clone().unwrap_or_else(default_disk_cache_dir);
+    let directory = if directory_any_overridden {
+        Some(DiskCacheConfig {
+            dir: directory_dir.unwrap_or_else(default_env_directory_cache_dir),
+            size: directory_sz.unwrap_or_else(default_disk_cache_size),
+            preprocessor_cache_mode: directory_preprocessor_mode_config,
+            rw_mode: directory_rw_mode,
         })
     } else {
         None
@@ -1198,6 +1244,7 @@ fn config_from_env() -> Result<EnvConfig> {
     let cache = CacheConfigs {
         azure,
         disk,
+        directory,
         gcs,
         gha,
         memcached,
@@ -2070,6 +2117,31 @@ fn test_env_basedirs_single() {
 
 #[test]
 #[serial(config_from_env)]
+fn test_directory_env_default_dir_follows_sccache_dir() {
+    let root = std::env::temp_dir().join("sccache-root");
+
+    let config = temp_env::with_vars(
+        [
+            ("SCCACHE_DIR", Some(root.as_os_str())),
+            (
+                "SCCACHE_DIRECTORY_CACHE_SIZE",
+                Some(std::ffi::OsStr::new("1G")),
+            ),
+            ("SCCACHE_DIRECTORY_DIR", None),
+        ],
+        || config_from_env().unwrap(),
+    );
+
+    let directory = config
+        .cache
+        .directory
+        .expect("directory cache should be configured");
+
+    assert_eq!(directory.dir, root);
+}
+
+#[test]
+#[serial(config_from_env)]
 #[cfg(not(target_os = "windows"))]
 fn test_env_basedirs_multiple() {
     unsafe {
@@ -2487,6 +2559,7 @@ key_prefix = "cosprefix"
                     preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
                     rw_mode: CacheModeConfig::ReadWrite,
                 }),
+                directory: None,
                 gcs: Some(GCSCacheConfig {
                     bucket: "bucket".to_owned(),
                     cred_path: Some("/psst/secret/cred".to_string()),

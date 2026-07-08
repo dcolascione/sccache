@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
+use crate::cache::directory_io::cache_write_from_file_objects;
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::PreprocessorCacheEntry;
@@ -939,6 +940,27 @@ where
                         .map(|_| ())
                         .map_err(|e| format!("{e:#}"));
                     Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
+                }
+                Request::StoragePutFileObjects {
+                    key,
+                    objects,
+                    stdout,
+                    stderr,
+                } => {
+                    debug!("handle_client: storage_put_file_objects key={}", key);
+                    let result = async {
+                        if me.storage.cache_type_name() != "directory" {
+                            bail!("storage backend does not support file-object puts");
+                        }
+                        let entry = cache_write_from_file_objects(objects, stdout, stderr)?;
+                        me.storage.put(&key, entry).await?;
+                        Ok(())
+                    }
+                    .await
+                    .map_err(|err: Error| format!("{err:#}"));
+                    Ok(Message::WithoutBody(Response::StoragePutFileObjects(
+                        result,
+                    )))
                 }
                 Request::StorageGetPreprocessorEntry { key } => {
                     debug!("handle_client: storage_get_preprocessor_entry key={}", key);

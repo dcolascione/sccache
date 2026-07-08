@@ -10,6 +10,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::directory_io::{
+    CacheWriteObject, CacheWriteObjectSource, DirectoryCacheRead, StorageFileObjectSource,
+    put_zip_object,
+};
 use super::utils::{get_file_mode, set_file_mode};
 use crate::errors::*;
 use fs_err as fs;
@@ -18,7 +22,6 @@ use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
-use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 /// Cache object sourced by a file.
@@ -72,7 +75,12 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 
 /// Data stored in the compiler cache.
 pub struct CacheRead {
-    zip: ZipArchive<Box<dyn ReadSeek>>,
+    source: CacheReadSource,
+}
+
+enum CacheReadSource {
+    Zip(ZipArchive<Box<dyn ReadSeek>>),
+    Directory(DirectoryCacheRead),
 }
 
 /// Represents a failure to decompress stored object data.
@@ -88,14 +96,26 @@ impl std::fmt::Display for DecompressionFailure {
 impl std::error::Error for DecompressionFailure {}
 
 impl CacheRead {
-    /// Create a cache entry from `reader`.
+    /// Create a cache entry from a legacy serialized ZIP `reader`.
     pub fn from<R>(reader: R) -> Result<CacheRead>
     where
         R: ReadSeek + 'static,
     {
         let z = ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>)
             .context("Failed to parse cache entry")?;
-        Ok(CacheRead { zip: z })
+        Ok(CacheRead {
+            source: CacheReadSource::Zip(z),
+        })
+    }
+
+    /// Create a cache entry from a directory-backed entry.
+    pub(crate) fn from_directory_with_max_size(
+        root: PathBuf,
+        max_size: Option<u64>,
+    ) -> Result<CacheRead> {
+        Ok(CacheRead {
+            source: CacheReadSource::Directory(DirectoryCacheRead::from_path(root, max_size)?),
+        })
     }
 
     /// Get an object from this cache entry at `name` and write it to `to`.
@@ -104,13 +124,19 @@ impl CacheRead {
     where
         T: Write,
     {
-        let file = self.zip.by_name(name).or(Err(DecompressionFailure))?;
-        if file.compression() != CompressionMethod::Stored {
-            bail!(DecompressionFailure);
+        match &mut self.source {
+            CacheReadSource::Zip(zip) => get_zip_object(zip, name, to),
+            CacheReadSource::Directory(directory) => directory.get_object(name, to),
         }
-        let mode = file.unix_mode();
-        zstd::stream::copy_decode(file, to).or(Err(DecompressionFailure))?;
-        Ok(mode)
+    }
+
+    fn get_object_to_temp(&mut self, name: &str, tmp: &mut NamedTempFile) -> Result<Option<u32>> {
+        match &mut self.source {
+            CacheReadSource::Zip(zip) => get_zip_object(zip, name, tmp),
+            CacheReadSource::Directory(directory) => {
+                directory.copy_object_to_path(name, tmp.path())
+            }
+        }
     }
 
     /// Get the stdout from this cache entry, if it exists.
@@ -124,9 +150,14 @@ impl CacheRead {
     }
 
     fn get_bytes(&mut self, name: &str) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        drop(self.get_object(name, &mut bytes));
-        bytes
+        match &mut self.source {
+            CacheReadSource::Zip(_) => {
+                let mut bytes = Vec::new();
+                drop(self.get_object(name, &mut bytes));
+                bytes
+            }
+            CacheReadSource::Directory(directory) => directory.get_bytes(name),
+        }
     }
 
     pub async fn extract_objects<T>(
@@ -164,19 +195,17 @@ impl CacheRead {
                 // move it to its final location so that other rustc invocations
                 // happening in parallel don't see a partially-written file.
                 match (NamedTempFile::new_in(dir), optional) {
-                    (Ok(mut tmp), _) => {
-                        match (self.get_object(&key, &mut tmp), optional) {
-                            (Ok(mode), _) => {
-                                tmp.persist(&path)?;
-                                if let Some(mode) = mode {
-                                    set_file_mode(path.as_path(), mode)?;
-                                }
+                    (Ok(mut tmp), _) => match (self.get_object_to_temp(&key, &mut tmp), optional) {
+                        (Ok(mode), _) => {
+                            tmp.persist(&path)?;
+                            if let Some(mode) = mode {
+                                set_file_mode(path.as_path(), mode)?;
                             }
-                            (Err(e), false) => return Err(e),
-                            // skip if no object found and it's optional
-                            (Err(_), true) => continue,
                         }
-                    }
+                        (Err(e), false) => return Err(e),
+                        // skip if no object found and it's optional
+                        (Err(_), true) => continue,
+                    },
                     (Err(e), false) => {
                         // Fall back to writing directly to the final location
                         warn!("Failed to create temp file on the same file system: {e}");
@@ -202,6 +231,23 @@ impl CacheRead {
     }
 }
 
+fn get_zip_object<T>(
+    zip: &mut ZipArchive<Box<dyn ReadSeek>>,
+    name: &str,
+    to: &mut T,
+) -> Result<Option<u32>>
+where
+    T: Write,
+{
+    let file = zip.by_name(name).or(Err(DecompressionFailure))?;
+    if file.compression() != CompressionMethod::Stored {
+        bail!(DecompressionFailure);
+    }
+    let mode = file.unix_mode();
+    zstd::stream::copy_decode(file, to).or(Err(DecompressionFailure))?;
+    Ok(mode)
+}
+
 #[cfg(unix)]
 fn is_path_null(path: &Path) -> bool {
     path == Path::new("/dev/null")
@@ -210,7 +256,7 @@ fn is_path_null(path: &Path) -> bool {
 #[cfg(windows)]
 fn is_path_null(path: &Path) -> bool {
     // For Windows, it appears that `NUL` with whatever extension is also a blackhole
-    // (at least for `CreateFileX`), so it does not suffice to check for an exact match
+    // (at least for `CreateFileX`), so it does not suffice to check for an exact match.
     // Also note that gcc, cl.exe, et al. append a correct extension automatically even
     // if the user asks for output to `NUL`.
     let Some(stem) = path.file_stem() else {
@@ -221,14 +267,18 @@ fn is_path_null(path: &Path) -> bool {
 
 /// Data to be stored in the compiler cache.
 pub struct CacheWrite {
-    zip: ZipWriter<Cursor<Vec<u8>>>,
+    objects: Vec<CacheWriteObject>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 impl CacheWrite {
     /// Create a new, empty cache entry.
     pub fn new() -> CacheWrite {
         CacheWrite {
-            zip: ZipWriter::new(Cursor::new(vec![])),
+            objects: Vec::new(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
         }
     }
 
@@ -248,11 +298,9 @@ impl CacheWrite {
                 let f = fs::File::open(&path)
                     .with_context(|| format!("failed to open file `{:?}`", path));
                 match (f, optional) {
-                    (Ok(mut f), _) => {
+                    (Ok(f), _) => {
                         let mode = get_file_mode(&f)?;
-                        entry.put_object(&key, &mut f, mode).with_context(|| {
-                            format!("failed to put object `{:?}` in cache entry", path)
-                        })?;
+                        entry.put_file_object_from_path(key, path, f, mode);
                     }
                     (Err(e), false) => return Err(e),
                     (Err(_), true) => continue,
@@ -263,53 +311,115 @@ impl CacheWrite {
         .await?
     }
 
+    pub(crate) fn put_file_object(&mut self, name: String, file: fs::File, mode: Option<u32>) {
+        self.objects.push(CacheWriteObject {
+            key: name,
+            source: CacheWriteObjectSource::File { file, path: None },
+            mode,
+        });
+    }
+
+    fn put_file_object_from_path(
+        &mut self,
+        name: String,
+        path: PathBuf,
+        file: fs::File,
+        mode: Option<u32>,
+    ) {
+        self.objects.push(CacheWriteObject {
+            key: name,
+            source: CacheWriteObjectSource::File {
+                file,
+                path: Some(path),
+            },
+            mode,
+        });
+    }
+
     /// Add an object containing the contents of `from` to this cache entry at `name`.
     /// If `mode` is `Some`, store the file entry with that mode.
     pub fn put_object<T>(&mut self, name: &str, from: &mut T, mode: Option<u32>) -> Result<()>
     where
         T: Read,
     {
-        // We're going to declare the compression method as "stored",
-        // but we're actually going to store zstd-compressed blobs.
-        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
-        let opts = if let Some(mode) = mode {
-            opts.unix_permissions(mode)
-        } else {
-            opts
-        };
-        self.zip
-            .start_file(name, opts)
-            .context("Failed to start cache entry object")?;
-
-        let compression_level = std::env::var("SCCACHE_CACHE_ZSTD_LEVEL")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(3);
-        zstd::stream::copy_encode(from, &mut self.zip, compression_level)?;
+        let mut bytes = Vec::new();
+        from.read_to_end(&mut bytes)?;
+        self.objects.push(CacheWriteObject {
+            key: name.to_owned(),
+            source: CacheWriteObjectSource::Bytes(bytes),
+            mode,
+        });
         Ok(())
     }
 
     pub fn put_stdout(&mut self, bytes: &[u8]) -> Result<()> {
-        self.put_bytes("stdout", bytes)
-    }
-
-    pub fn put_stderr(&mut self, bytes: &[u8]) -> Result<()> {
-        self.put_bytes("stderr", bytes)
-    }
-
-    fn put_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        if !bytes.is_empty() {
-            let mut cursor = Cursor::new(bytes);
-            return self.put_object(name, &mut cursor, None);
-        }
+        self.stdout = bytes.to_vec();
         Ok(())
     }
 
-    /// Finish writing data to the cache entry writer, and return the data.
+    pub fn put_stderr(&mut self, bytes: &[u8]) -> Result<()> {
+        self.stderr = bytes.to_vec();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn put_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let mut cursor = Cursor::new(bytes);
+        self.put_object(name, &mut cursor, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            objects: self
+                .objects
+                .iter()
+                .map(CacheWriteObject::try_clone)
+                .collect::<Result<Vec<_>>>()?,
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+        })
+    }
+
+    pub(crate) fn file_object_sources(&self) -> Result<Option<Vec<StorageFileObjectSource>>> {
+        self.objects
+            .iter()
+            .map(CacheWriteObject::file_source)
+            .collect()
+    }
+    pub(crate) fn objects(&self) -> &[CacheWriteObject] {
+        &self.objects
+    }
+
+    pub(crate) fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub(crate) fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+
+    /// Finish writing data to the cache entry writer, and return legacy ZIP bytes.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let CacheWrite { mut zip } = self;
+        let mut zip = ZipWriter::new(Cursor::new(vec![]));
+        for object in self.objects {
+            object.write_to_zip(&mut zip)?;
+        }
+        if !self.stdout.is_empty() {
+            put_zip_object(&mut zip, "stdout", &mut Cursor::new(self.stdout), None)?;
+        }
+        if !self.stderr.is_empty() {
+            put_zip_object(&mut zip, "stderr", &mut Cursor::new(self.stderr), None)?;
+        }
         let cur = zip.finish().context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
+    }
+
+    /// Finish writing legacy ZIP bytes on a blocking worker thread.
+    pub(crate) async fn finish_blocking(self) -> Result<Vec<u8>> {
+        tokio::task::spawn_blocking(move || self.finish())
+            .await
+            .context("spawn_blocking panicked")?
     }
 }
 

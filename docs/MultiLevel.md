@@ -128,7 +128,12 @@ export SCCACHE_MULTILEVEL_CHAIN="disk,redis,s3"
 
 **Format**: Comma-separated list of cache backend names
 **Order**: Left-to-right is fast-to-slow (L0, L1, L2, ...)
-**Valid names**: `disk`, `redis`, `memcached`, `s3`, `gcs`, `azure`, `gha`, `webdav`, `oss`, `cos`
+**Valid names**: `disk`, `directory`, `redis`, `memcached`, `s3`, `gcs`, `azure`, `gha`, `webdav`, `oss`, `cos`
+
+`disk` and `directory` are backend names in `SCCACHE_MULTILEVEL_CHAIN`, not alternate
+configuration names. Configure `disk` with `[cache.disk]` or `SCCACHE_DIR`, and
+`directory` with `[cache.directory]` or `SCCACHE_DIRECTORY_*`. The directory
+backend uses the reserved `directory` child of its configured cache root.
 
 ### Write Error Policy Configuration
 

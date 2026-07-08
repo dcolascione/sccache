@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
     feature = "cos"
 ))]
 use crate::cache::build_single_cache;
+use crate::cache::directory::DirectoryCache;
 use crate::cache::disk::DiskCache;
 use crate::cache::{Cache, CacheMode, CacheWrite, Storage};
 use crate::compiler::PreprocessorCacheEntry;
@@ -47,7 +48,7 @@ use crate::compiler::PreprocessorCacheEntry;
     feature = "cos"
 ))]
 use crate::config::CacheType;
-use crate::config::{Config, PreprocessorCacheModeConfig, WriteErrorPolicy};
+use crate::config::{Config, DiskCacheConfig, PreprocessorCacheModeConfig, WriteErrorPolicy};
 use crate::errors::*;
 
 /// Increment an atomic stats counter, handling the Option check.
@@ -443,6 +444,34 @@ impl MultiLevelStorage {
                 ));
                 storages.push(disk_storage);
                 trace!("Added disk cache level");
+            } else if level_name.eq_ignore_ascii_case("directory") {
+                let directory_config =
+                    config
+                        .cache_configs
+                        .directory
+                        .clone()
+                        .unwrap_or_else(|| DiskCacheConfig {
+                            dir: config.fallback_cache.dir.clone(),
+                            size: config.fallback_cache.size,
+                            preprocessor_cache_mode: config.fallback_cache.preprocessor_cache_mode,
+                            rw_mode: config.fallback_cache.rw_mode,
+                        });
+                let preprocessor_cache_mode_config = directory_config.preprocessor_cache_mode;
+                let rw_mode = directory_config.rw_mode.into();
+                debug!(
+                    "Adding directory cache level with dir {:?}, size {}",
+                    directory_config.dir, directory_config.size
+                );
+                let directory_storage: Arc<dyn Storage> = Arc::new(DirectoryCache::new(
+                    &directory_config.dir,
+                    directory_config.size,
+                    pool,
+                    preprocessor_cache_mode_config,
+                    rw_mode,
+                    config.basedirs.clone(),
+                ));
+                storages.push(directory_storage);
+                trace!("Added directory cache level");
             } else {
                 // Build remote cache - get the appropriate CacheType
                 #[cfg(any(
@@ -752,7 +781,7 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
-        let data: Bytes = entry.finish()?.into();
+        let data: Bytes = entry.finish_blocking().await?.into();
         self.put_raw(key, data).await
     }
 

@@ -105,7 +105,51 @@ impl Storage for IpcStorage {
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
-        self.put_raw(key, entry.finish()?.into()).await
+        if self.handshake.cache_type_name != "directory" {
+            return self
+                .put_raw(key, entry.finish_blocking().await?.into())
+                .await;
+        }
+
+        match entry.file_object_sources() {
+            Ok(Some(objects)) => {
+                match self
+                    .rpc(Request::StoragePutFileObjects {
+                        key: key.to_owned(),
+                        objects,
+                        stdout: entry.stdout().to_vec(),
+                        stderr: entry.stderr().to_vec(),
+                    })
+                    .await
+                {
+                    Ok(Response::StoragePutFileObjects(Ok(()))) => return Ok(Duration::ZERO),
+                    Ok(Response::StoragePutFileObjects(Err(err))) => {
+                        debug!(
+                            "IpcStorage::put file-object RPC failed, falling back to raw: {err}"
+                        );
+                    }
+                    Ok(other) => {
+                        debug!(
+                            "IpcStorage::put file-object RPC returned unexpected response, falling back to raw: {other:?}"
+                        );
+                    }
+                    Err(err) => {
+                        debug!(
+                            "IpcStorage::put file-object RPC error, falling back to raw: {err:#}"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                debug!(
+                    "IpcStorage::put failed to collect file-object metadata, falling back to raw: {err:#}"
+                );
+            }
+        }
+
+        self.put_raw(key, entry.finish_blocking().await?.into())
+            .await
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {

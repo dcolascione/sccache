@@ -41,7 +41,8 @@ token = "secrettoken"
 
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
-# Each level must be separately configured below.
+# The chain uses backend names only. Remote backends must be configured below.
+# Configure the local `directory` backend with [cache.directory] or SCCACHE_DIRECTORY_*.
 # See docs/MultiLevel.md for details.
 [cache.multilevel]
 chain = ["disk", "redis", "s3"]
@@ -58,6 +59,13 @@ key_prefix = ""
 [cache.disk]
 dir = "/tmp/.cache/sccache"
 size = 7516192768 # 7 GiBytes
+
+# Directory-backed local cache. Stores each cache entry as raw files under the
+# reserved `directory` child, enabling reflink/copy restore on cache hits.
+[cache.directory]
+dir = "/tmp/.cache/sccache"
+size = 7516192768 # 7 GiBytes
+rw_mode = "READ_WRITE"
 
 # See the local docs on more explanations about this mode
 [cache.disk.preprocessor_cache_mode]
@@ -189,8 +197,8 @@ Multi-level caching enables hierarchical cache storage with automatic backfill. 
 
 * `SCCACHE_MULTILEVEL_CHAIN` comma-separated list of cache backend names to use in hierarchy (e.g., `disk,redis,s3`)
   - Order matters: left-to-right is fast-to-slow (L0, L1, L2, ...)
-  - Valid names: `disk`, `redis`, `memcached`, `s3`, `gcs`, `azure`, `gha`, `webdav`, `oss`, `cos`
-  - Each level must be separately configured with its own environment variables
+  - Valid names: `disk`, `directory`, `redis`, `memcached`, `s3`, `gcs`, `azure`, `gha`, `webdav`, `oss`, `cos`
+  - These are backend names, not config section names. Configure `disk` with `[cache.disk]`/`SCCACHE_DIR`; configure `directory` with `[cache.directory]`/`SCCACHE_DIRECTORY_*`. The directory backend stores data in the reserved `directory` child of its configured cache root.
   - If not set, sccache uses single-level mode (legacy behavior)
 * `SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY` controls error handling on cache writes (default: `l0`)
   - `ignore` - never fail on write errors, log warnings only (most permissive)
@@ -224,6 +232,13 @@ export SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY="all"
 * `SCCACHE_CACHE_SIZE` maximum size of the local on disk cache i.e. `2G` - default is 10G
 * `SCCACHE_DIRECT` enable/disable preprocessor caching (see [the local doc](Local.md))
 * `SCCACHE_LOCAL_RW_MODE` the mode that the cache will operate in (`READ_ONLY` or `READ_WRITE`)
+
+#### directory (local, reflinkable)
+
+* `SCCACHE_DIRECTORY_DIR` sets the cache root for the `directory` backend; data is stored in its reserved `directory` child. The root defaults to `SCCACHE_DIR`.
+* `SCCACHE_DIRECTORY_CACHE_SIZE` maximum size of the directory-backed cache i.e. `2G` - default is 10G
+* `SCCACHE_DIRECTORY_RW_MODE` local directory cache mode, either `READ_ONLY` or `READ_WRITE`
+* `SCCACHE_DIRECTORY_DIRECT` controls preprocessor cache mode for the directory-backed cache
 
 #### s3 compatible
 

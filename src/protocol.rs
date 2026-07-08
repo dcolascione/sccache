@@ -1,3 +1,4 @@
+use crate::cache::directory_io::StorageFileObjectSource;
 use crate::cache::{CacheMode, GetPathResult};
 use crate::compiler::ColorMode;
 use crate::config::PreprocessorCacheModeConfig;
@@ -35,6 +36,16 @@ pub enum Request {
     StoragePutPreprocessorEntry { key: String, entry_bytes: Vec<u8> },
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),
+    /// Store file-backed objects under `key`.
+    ///
+    /// Protocol variants are append-only so existing bincode discriminants
+    /// remain stable across daemon upgrades.
+    StoragePutFileObjects {
+        key: String,
+        objects: Vec<StorageFileObjectSource>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
 }
 
 /// A server response.
@@ -68,6 +79,11 @@ pub enum Response {
     StoragePutPreprocessorEntry(Result<(), String>),
     /// Response for `Request::RecordStats`.
     RecordStats,
+    /// Response for `Request::StoragePutFileObjects`.
+    ///
+    /// Protocol variants are append-only so existing bincode discriminants
+    /// remain stable across daemon upgrades.
+    StoragePutFileObjects(Result<(), String>),
 }
 
 /// Possible responses from the server for a `Compile` request.

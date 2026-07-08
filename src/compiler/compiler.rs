@@ -1897,8 +1897,9 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::cache::directory::DirectoryCache;
     use crate::cache::disk::DiskCache;
-    use crate::cache::{CacheMode, CacheRead};
+    use crate::cache::{CacheMode, CacheRead, Storage};
     use crate::config::PreprocessorCacheModeConfig;
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
@@ -1909,6 +1910,43 @@ mod test {
     use std::time::Duration;
     use test_case::test_case;
     use tokio::runtime::Runtime;
+    #[derive(Clone, Copy, Debug)]
+    enum LocalCacheBackend {
+        Disk,
+        Directory,
+    }
+
+    impl LocalCacheBackend {
+        fn storage(
+            self,
+            root: PathBuf,
+            pool: &tokio::runtime::Handle,
+            preprocessor_cache_mode: bool,
+        ) -> Arc<dyn Storage> {
+            let preprocessor_cache_mode_config = PreprocessorCacheModeConfig {
+                use_preprocessor_cache_mode: preprocessor_cache_mode,
+                ..Default::default()
+            };
+            match self {
+                LocalCacheBackend::Disk => Arc::new(DiskCache::new(
+                    root,
+                    u64::MAX,
+                    pool,
+                    preprocessor_cache_mode_config,
+                    CacheMode::ReadWrite,
+                    vec![],
+                )),
+                LocalCacheBackend::Directory => Arc::new(DirectoryCache::new(
+                    root,
+                    u64::MAX,
+                    pool,
+                    preprocessor_cache_mode_config,
+                    CacheMode::ReadWrite,
+                    vec![],
+                )),
+            }
+        }
+    }
 
     #[test]
     fn test_c_preprocessing_consistent() {
@@ -2539,29 +2577,27 @@ LLVM version: 6.0",
         assert_eq!(CompilerKind::C(CCompilerKind::Gcc), c.kind());
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_compiler_get_cached_or_compile(preprocessor_cache_mode: bool) {
+    #[test_case(true, LocalCacheBackend::Disk ; "disk with preprocessor cache")]
+    #[test_case(false, LocalCacheBackend::Disk ; "disk without preprocessor cache")]
+    #[test_case(true, LocalCacheBackend::Directory ; "directory with preprocessor cache")]
+    #[test_case(false, LocalCacheBackend::Directory ; "directory without preprocessor cache")]
+    fn test_compiler_get_cached_or_compile(
+        preprocessor_cache_mode: bool,
+        cache_backend: LocalCacheBackend,
+    ) {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
         let gcc = f.mk_bin("gcc").unwrap();
         let runtime = Runtime::new().unwrap();
         let pool = runtime.handle().clone();
-        let storage = DiskCache::new(
-            f.tempdir.path().join("cache"),
-            u64::MAX,
+        let storage = cache_backend.storage(
+            f.tempdir.path().join(format!("{cache_backend:?}-cache")),
             &pool,
-            PreprocessorCacheModeConfig {
-                use_preprocessor_cache_mode: preprocessor_cache_mode,
-                ..Default::default()
-            },
-            CacheMode::ReadWrite,
-            vec![],
+            preprocessor_cache_mode,
         );
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
-        let storage = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
 
         // Pretend to be GCC.

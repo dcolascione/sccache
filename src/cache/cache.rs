@@ -17,6 +17,7 @@ use super::cache_io::*;
 use crate::cache::azure::AzureBlobCache;
 #[cfg(feature = "cos")]
 use crate::cache::cos::COSCache;
+use crate::cache::directory::DirectoryCache;
 use crate::cache::disk::DiskCache;
 #[cfg(feature = "gcs")]
 use crate::cache::gcs::GCSCache;
@@ -244,7 +245,7 @@ impl Storage for RemoteStorage {
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         trace!("RemoteStorage::put({})", key);
         // Delegate to put_raw after serializing the entry
-        let data = entry.finish()?;
+        let data = entry.finish_blocking().await?;
         self.put_raw(key, data.into()).await
     }
 
@@ -615,6 +616,22 @@ pub fn storage_from_config(
     if let Some(cache_type) = &config.cache {
         debug!("Configuring single cache from CacheType");
         return build_single_cache(cache_type, &config.basedirs, pool);
+    }
+
+    if let Some(directory_config) = config.cache_configs.directory.as_ref() {
+        let rw_mode = directory_config.rw_mode.into();
+        debug!(
+            "Init directory cache with dir {:?}, size {}",
+            directory_config.dir, directory_config.size
+        );
+        return Ok(Arc::new(DirectoryCache::new(
+            &directory_config.dir,
+            directory_config.size,
+            pool,
+            directory_config.preprocessor_cache_mode,
+            rw_mode,
+            config.basedirs.clone(),
+        )));
     }
 
     // No remote cache configured - use disk cache only

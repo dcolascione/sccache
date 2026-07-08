@@ -155,7 +155,7 @@ impl Storage for DiskCache {
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         trace!("DiskCache::put({})", key);
         // Delegate to put_raw after serializing the entry
-        let data = entry.finish()?;
+        let data = entry.finish_blocking().await?;
         self.put_raw(key, data.into()).await
     }
 

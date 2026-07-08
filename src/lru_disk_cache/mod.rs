@@ -21,6 +21,7 @@ use walkdir::WalkDir;
 use crate::util::OsStrExt;
 
 const TEMPFILE_PREFIX: &str = ".sccachetmp";
+const DIRECTORY_CACHE_DIR: &str = "directory";
 
 struct FileSize;
 
@@ -38,8 +39,19 @@ impl<K> Meter<K, u64> for FileSize {
 /// Return an iterator of `(path, size)` of files under `path` sorted by ascending last-modified
 /// time, such that the oldest modified file is returned first.
 fn get_all_files<P: AsRef<Path>>(path: P) -> Box<dyn Iterator<Item = (PathBuf, u64)>> {
-    let mut files: Vec<_> = WalkDir::new(path.as_ref())
+    let root = path.as_ref();
+    let mut files: Vec<_> = WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| {
+            // The directory cache reserves root/directory. Disk cache keys start
+            // with one-character shard directories, so the namespaces cannot overlap.
+            entry.depth() != 1
+                || !entry.file_type().is_dir()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(DIRECTORY_CACHE_DIR)
+        })
         .filter_map(|e| {
             e.ok().and_then(|f| {
                 // Only look at files
@@ -503,6 +515,24 @@ mod tests {
         let c = LruDiskCache::new(f.tmp(), 20).unwrap();
         assert_eq!(c.size(), 20);
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn test_disk_scan_skips_directory_cache_child() {
+        let f = TestFixture::new();
+        let managed = f.create_file("file1", 10);
+        let directory_entry = f.create_file("directory/a/b/c/key/manifest", 100);
+        let mut cache = LruDiskCache::new(f.tmp(), 10).unwrap();
+
+        assert_eq!(cache.size(), 10);
+        assert_eq!(cache.len(), 1);
+        assert!(managed.exists());
+        assert!(directory_entry.exists());
+
+        cache.insert_bytes("file2", &[0; 10]).unwrap();
+
+        assert!(!managed.exists());
+        assert!(directory_entry.exists());
     }
 
     #[test]
