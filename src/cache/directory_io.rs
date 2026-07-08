@@ -10,7 +10,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::config::{DirectoryCacheLinkConfig, DirectoryCacheLinkType};
 use crate::errors::*;
+use filetime::{FileTime, set_file_handle_times};
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 #[cfg(not(unix))]
@@ -209,25 +211,33 @@ pub(crate) struct DirectoryCacheRead {
     objects: Vec<DirectoryCacheObjectRead>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    link: DirectoryCacheLinkConfig,
 }
 
 struct DirectoryCacheObjectRead {
     key: String,
     file: fs::File,
+    path: PathBuf,
     mode: Option<u32>,
 }
 impl DirectoryCacheRead {
-    pub(crate) fn from_path(root: PathBuf, max_size: Option<u64>) -> Result<Self> {
+    pub(crate) fn from_path(
+        root: PathBuf,
+        max_size: Option<u64>,
+        link: DirectoryCacheLinkConfig,
+    ) -> Result<Self> {
         ensure_plain_directory(&root)?;
         ensure_plain_directory(&root.join(DIRECTORY_CACHE_OBJECTS_DIR))?;
         let manifest = read_directory_cache_manifest(&root)?;
 
         let mut objects = Vec::with_capacity(manifest.objects.len());
         for object in manifest.objects {
+            let path = root.join(DIRECTORY_CACHE_OBJECTS_DIR).join(&object.file);
             let file = open_directory_cache_object_file(&root, &object.file)?;
             objects.push(DirectoryCacheObjectRead {
                 key: object.key,
                 file,
+                path,
                 mode: object.mode,
             });
         }
@@ -243,6 +253,7 @@ impl DirectoryCacheRead {
                 &root.join(DIRECTORY_CACHE_STDERR_FILE),
                 stdio_limit,
             )?,
+            link,
         })
     }
 
@@ -265,8 +276,27 @@ impl DirectoryCacheRead {
 
     pub(crate) fn copy_object_to_path(&self, name: &str, to: &Path) -> Result<Option<u32>> {
         let object = self.object(name)?;
-        copy_file_reflink_or_copy(&object.file, to)?;
+        copy_file_link_or_copy(&object.file, &object.path, to, self.link)?;
         Ok(object.mode)
+    }
+
+    pub(crate) fn touch_data_atime(&self) -> bool {
+        let now = FileTime::now();
+        for object in &self.objects {
+            match set_file_handle_times(object.file.file(), Some(now), None) {
+                Ok(()) => return true,
+                Err(err) => trace!(
+                    "Failed to update directory-cache object atime {}: {}",
+                    object.path.display(),
+                    err
+                ),
+            }
+        }
+        false
+    }
+
+    pub(crate) fn link_required(&self) -> bool {
+        self.link.required
     }
 
     pub(crate) fn get_bytes(&self, name: &str) -> Vec<u8> {
@@ -278,11 +308,53 @@ impl DirectoryCacheRead {
     }
 }
 pub(crate) fn copy_file_reflink_or_copy(from: &fs::File, to: &Path) -> Result<u64> {
-    match reflink_file(from, to) {
+    copy_file_with_fallback(from, to, false, "reflink", |from, to| {
+        reflink_file(from, to)
+    })
+}
+
+fn copy_file_link_or_copy(
+    from: &fs::File,
+    from_path: &Path,
+    to: &Path,
+    link: DirectoryCacheLinkConfig,
+) -> Result<u64> {
+    match link.link_type {
+        DirectoryCacheLinkType::HardLink => {
+            copy_file_with_fallback(from, to, link.required, "hard link", |from, to| {
+                hard_link_file(from, from_path, to)
+            })
+        }
+        DirectoryCacheLinkType::Symlink => {
+            copy_file_with_fallback(from, to, link.required, "symlink", |from, to| {
+                symlink_file(from, from_path, to)
+            })
+        }
+        DirectoryCacheLinkType::Reflink => {
+            copy_file_with_fallback(from, to, link.required, "reflink", reflink_file)
+        }
+    }
+}
+
+fn copy_file_with_fallback<F>(
+    from: &fs::File,
+    to: &Path,
+    required: bool,
+    link_name: &str,
+    link: F,
+) -> Result<u64>
+where
+    F: FnOnce(&fs::File, &Path) -> std::io::Result<()>,
+{
+    match link(from, to) {
         Ok(()) => Ok(from.metadata()?.len()),
+        Err(err) if required => {
+            Err(err).with_context(|| format!("Failed to {link_name} file to {}", to.display()))
+        }
         Err(err) => {
             trace!(
-                "Failed to reflink file to {}, falling back to copy: {}",
+                "Failed to {} file to {}, falling back to copy: {}",
+                link_name,
                 to.display(),
                 err
             );
@@ -357,6 +429,79 @@ fn reflink_aligned_ranges(len: u64, alignment: u64, max_chunk: u64) -> Vec<(u64,
         offset += byte_count;
     }
     ranges
+}
+
+fn symlink_file(from: &fs::File, from_path: &Path, to: &Path) -> std::io::Result<()> {
+    let source_identity = StorageFileObjectIdentity::from_file(from.file())?;
+    if !source_identity.is_stable() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stable file identity is unavailable",
+        ));
+    }
+
+    let target = fs::canonicalize(from_path)?;
+    let target_file = open_cache_file_no_follow(&target)?;
+    if StorageFileObjectIdentity::from_file(target_file.file())? != source_identity {
+        return Err(std::io::Error::other(
+            "symlink target does not match the open cache object",
+        ));
+    }
+
+    match fs::remove_file(to) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    create_file_symlink(&target, to)
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_file_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file symlinks are not supported on this platform",
+    ))
+}
+
+fn hard_link_file(from: &fs::File, from_path: &Path, to: &Path) -> std::io::Result<()> {
+    // The restored output shares this inode. Callers must treat it as immutable;
+    // later reads may update the same atime used by directory-cache retention.
+    let source_identity = StorageFileObjectIdentity::from_file(from.file())?;
+    if !source_identity.is_stable() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stable file identity is unavailable",
+        ));
+    }
+
+    match fs::remove_file(to) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    fs::hard_link(from_path, to)?;
+
+    let linked = open_cache_file_no_follow(to)?;
+    if StorageFileObjectIdentity::from_file(linked.file())? != source_identity {
+        drop(linked);
+        let _ = fs::remove_file(to);
+        return Err(std::io::Error::other(
+            "hard link target does not match the open cache object",
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1000,6 +1145,87 @@ mod tests {
             assert_eq!(handle.join().unwrap(), object_bytes);
         }
     }
+    #[test]
+    fn link_failure_copies_by_default() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("source");
+        let destination = tempdir.path().join("destination");
+        fs::write(&source_path, b"object").unwrap();
+        let source = fs::File::open(source_path).unwrap();
+
+        let copied = copy_file_with_fallback(&source, &destination, false, "test link", |_, _| {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test"))
+        })
+        .unwrap();
+
+        assert_eq!(copied, 6);
+        assert_eq!(fs::read(destination).unwrap(), b"object");
+    }
+
+    #[test]
+    fn required_link_failure_does_not_copy() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("source");
+        let destination = tempdir.path().join("destination");
+        fs::write(&source_path, b"object").unwrap();
+        let source = fs::File::open(source_path).unwrap();
+
+        let error = copy_file_with_fallback(&source, &destination, true, "test link", |_, _| {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Failed to test link file"));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_hard_link_does_not_copy_when_cache_path_disappears() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("source");
+        let destination = tempdir.path().join("destination");
+        fs::write(&source_path, b"object").unwrap();
+        let source = fs::File::open(&source_path).unwrap();
+        fs::remove_file(&source_path).unwrap();
+
+        let read = DirectoryCacheRead {
+            objects: vec![DirectoryCacheObjectRead {
+                key: "o".to_owned(),
+                file: source,
+                path: source_path,
+                mode: None,
+            }],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            link: DirectoryCacheLinkConfig {
+                link_type: DirectoryCacheLinkType::HardLink,
+                required: true,
+            },
+        };
+
+        assert!(read.copy_object_to_path("o", &destination).is_err());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn hard_link_replaces_target_with_cache_object_inode() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("source");
+        let destination = tempdir.path().join("destination");
+        fs::write(&source_path, b"object").unwrap();
+        fs::write(&destination, b"temporary").unwrap();
+        let source = fs::File::open(&source_path).unwrap();
+
+        hard_link_file(&source, &source_path, &destination).unwrap();
+
+        let destination = fs::File::open(destination).unwrap();
+        assert_eq!(
+            StorageFileObjectIdentity::from_file(source.file()).unwrap(),
+            StorageFileObjectIdentity::from_file(destination.file()).unwrap()
+        );
+    }
+
     #[test]
     fn reflink_aligned_ranges_split_on_alignment_and_max_chunk() {
         assert_eq!(

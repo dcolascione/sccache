@@ -1906,7 +1906,7 @@ mod test {
     use crate::cache::directory::DirectoryCache;
     use crate::cache::disk::DiskCache;
     use crate::cache::{CacheMode, CacheRead, Storage};
-    use crate::config::PreprocessorCacheModeConfig;
+    use crate::config::{DirectoryCacheLinkConfig, PreprocessorCacheModeConfig};
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
@@ -1948,6 +1948,7 @@ mod test {
                     pool,
                     preprocessor_cache_mode_config,
                     CacheMode::ReadWrite,
+                    DirectoryCacheLinkConfig::default(),
                     vec![],
                 )),
             }

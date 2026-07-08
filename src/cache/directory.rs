@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cache::bulk_stat::{BULK_STAT_BATCH_SIZE, bulk_stat};
 use crate::cache::directory_io::{
     DIRECTORY_CACHE_DIR, DIRECTORY_CACHE_MANIFEST_FILE, DIRECTORY_CACHE_MANIFEST_VERSION,
     DIRECTORY_CACHE_OBJECTS_DIR, DIRECTORY_CACHE_STDERR_FILE, DIRECTORY_CACHE_STDIO_MAX_BYTES,
@@ -20,7 +21,7 @@ use crate::cache::directory_io::{
 };
 use crate::cache::{Cache, CacheMode, CacheRead, CacheWrite, DecompressionFailure, Storage};
 use crate::compiler::PreprocessorCacheEntry;
-use crate::config::PreprocessorCacheModeConfig;
+use crate::config::{DirectoryCacheLinkConfig, PreprocessorCacheModeConfig};
 use crate::errors::*;
 use crate::lru_disk_cache::{LruDiskCache, ReadSeek};
 use async_trait::async_trait;
@@ -28,6 +29,7 @@ use bytes::Bytes;
 use filetime::{FileTime, set_file_times};
 use fs_err as fs;
 use fs2::FileExt;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -45,13 +47,14 @@ const TEMP_ENTRY_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// A local cache that stores each compile cache entry as a directory.
 ///
 /// Each output object is a regular file under `objects/`, so cache hits can
-/// clone or copy the object directly into the requested compiler output path.
+/// link or copy the object directly into the requested compiler output path.
 pub struct DirectoryCache {
     root: PathBuf,
     max_size: u64,
     pool: tokio::runtime::Handle,
     preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
     rw_mode: CacheMode,
+    link: DirectoryCacheLinkConfig,
     basedirs: Vec<Vec<u8>>,
 }
 
@@ -63,6 +66,7 @@ impl DirectoryCache {
         pool: &tokio::runtime::Handle,
         preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
         rw_mode: CacheMode,
+        link: DirectoryCacheLinkConfig,
         basedirs: Vec<Vec<u8>>,
     ) -> DirectoryCache {
         Self::new_at_path(
@@ -71,6 +75,7 @@ impl DirectoryCache {
             pool,
             preprocessor_cache_mode_config,
             rw_mode,
+            link,
             basedirs,
         )
     }
@@ -81,6 +86,7 @@ impl DirectoryCache {
         pool: &tokio::runtime::Handle,
         preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
         rw_mode: CacheMode,
+        link: DirectoryCacheLinkConfig,
         basedirs: Vec<Vec<u8>>,
     ) -> DirectoryCache {
         DirectoryCache {
@@ -89,6 +95,7 @@ impl DirectoryCache {
             pool: pool.clone(),
             preprocessor_cache_mode_config,
             rw_mode,
+            link,
             basedirs,
         }
     }
@@ -336,7 +343,91 @@ fn directory_size(path: &Path) -> Result<u64> {
 struct DirectoryEntry {
     path: PathBuf,
     size: u64,
-    modified: SystemTime,
+    last_used: SystemTime,
+}
+
+struct ScannedDirectoryEntry {
+    entry: DirectoryEntry,
+    has_manifest: bool,
+}
+
+fn scanned_entry_path<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
+    // `make_key_path` places entries beneath three shards and the full key.
+    const ENTRY_COMPONENTS: usize = 4;
+
+    let depth = path.strip_prefix(root).ok()?.components().count();
+    if depth <= ENTRY_COMPONENTS {
+        return None;
+    }
+    path.ancestors().nth(depth - ENTRY_COMPONENTS)
+}
+
+fn analyze_stat_batch(
+    root: &Path,
+    paths: &[PathBuf],
+    entries: &mut Vec<ScannedDirectoryEntry>,
+    entry_indices: &mut HashMap<PathBuf, usize>,
+) -> Result<()> {
+    for (path, stat) in paths.iter().zip(bulk_stat(paths)) {
+        let stat = match stat {
+            Ok(stat) => stat,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to stat cache path {}", path.display()));
+            }
+        };
+        if !stat.is_file {
+            continue;
+        }
+
+        let Some(entry_path) = scanned_entry_path(root, path) else {
+            continue;
+        };
+        let index = match entry_indices.get(entry_path) {
+            Some(&index) => index,
+            None => {
+                let index = entries.len();
+                entry_indices.insert(entry_path.to_path_buf(), index);
+                entries.push(ScannedDirectoryEntry {
+                    entry: DirectoryEntry {
+                        path: entry_path.to_path_buf(),
+                        size: 0,
+                        last_used: SystemTime::UNIX_EPOCH,
+                    },
+                    has_manifest: false,
+                });
+                index
+            }
+        };
+        let scanned = &mut entries[index];
+        scanned.entry.size += stat.size;
+
+        if path.parent() == Some(entry_path)
+            && path.file_name() == Some(OsStr::new(DIRECTORY_CACHE_MANIFEST_FILE))
+        {
+            scanned.has_manifest = true;
+            if let Some(modified) = stat.modified {
+                scanned.entry.last_used = scanned.entry.last_used.max(modified);
+            }
+        }
+
+        // Use the newer of manifest mtime and data-object atime for
+        // eviction. Hard-linked and symlinked outputs can advance the
+        // latter through ordinary reads. `relatime` can make that signal
+        // coarse, while `noatime` suppresses automatic updates.
+        let is_data_object = path.parent().is_some_and(|parent| {
+            parent.file_name() == Some(OsStr::new(DIRECTORY_CACHE_OBJECTS_DIR))
+                && parent.parent() == Some(entry_path)
+        });
+        if is_data_object {
+            if let Some(accessed) = stat.accessed {
+                scanned.entry.last_used = scanned.entry.last_used.max(accessed);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn scan_entries(root: &Path) -> Result<Vec<DirectoryEntry>> {
@@ -345,34 +436,31 @@ fn scan_entries(root: &Path) -> Result<Vec<DirectoryEntry>> {
     }
 
     let mut entries = Vec::new();
+    let mut entry_indices = HashMap::new();
+    let mut paths = Vec::with_capacity(BULK_STAT_BATCH_SIZE);
+
+    // Bound memory while streaming directory enumeration through bulk stat
+    // and immediate entry aggregation.
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
     {
-        if !entry.file_type().is_file()
-            || entry.file_name() != OsStr::new(DIRECTORY_CACHE_MANIFEST_FILE)
-        {
-            continue;
+        paths.push(entry.into_path());
+        if paths.len() == BULK_STAT_BATCH_SIZE {
+            analyze_stat_batch(root, &paths, &mut entries, &mut entry_indices)?;
+            paths.clear();
         }
-
-        let Some(entry_path) = entry.path().parent() else {
-            continue;
-        };
-        if is_temp_entry(entry_path) {
-            continue;
-        }
-
-        entries.push(DirectoryEntry {
-            path: entry_path.to_path_buf(),
-            size: directory_size(entry_path)?,
-            modified: entry
-                .metadata()?
-                .modified()
-                .unwrap_or(SystemTime::UNIX_EPOCH),
-        });
+    }
+    if !paths.is_empty() {
+        analyze_stat_batch(root, &paths, &mut entries, &mut entry_indices)?;
     }
 
-    Ok(entries)
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.has_manifest)
+        .map(|entry| entry.entry)
+        .collect())
 }
 
 fn make_space(root: &Path, max_size: u64, new_size: u64, replacing: &Path) -> Result<()> {
@@ -392,7 +480,7 @@ fn make_space(root: &Path, max_size: u64, new_size: u64, replacing: &Path) -> Re
         .sum::<u64>();
 
     entries.retain(|entry| entry.path != replacing);
-    entries.sort_by_key(|entry| entry.modified);
+    entries.sort_by_key(|entry| entry.last_used);
 
     while total + new_size > max_size {
         let Some(entry) = entries.first() else {
@@ -407,16 +495,11 @@ fn make_space(root: &Path, max_size: u64, new_size: u64, replacing: &Path) -> Re
     Ok(())
 }
 
-fn touch_entry(path: &Path) {
-    let now = FileTime::now();
-    if let Err(err) = set_file_times(path, now, now) {
-        trace!(
-            "Failed to update cache entry time {}: {}",
-            path.display(),
-            err
-        );
-    }
+fn touch_manifest(path: &Path) {
     let manifest = path.join(DIRECTORY_CACHE_MANIFEST_FILE);
+    let now = FileTime::now();
+    // Setting both timestamps to now permits a group-writable non-owner to
+    // record the hit; eviction uses only manifest mtime.
     if let Err(err) = set_file_times(&manifest, now, now) {
         trace!(
             "Failed to update cache entry manifest time {}: {}",
@@ -756,6 +839,7 @@ impl Storage for DirectoryCache {
         let root = self.root.clone();
         let relative = make_key_path(key)?;
         let max_size = self.max_size;
+        let link = self.link;
         let create_lock = self.rw_mode == CacheMode::ReadWrite;
         self.pool
             .spawn_blocking(move || {
@@ -763,8 +847,13 @@ impl Storage for DirectoryCache {
                 let Some(path) = ensure_relative_directory(&root, &relative, false)? else {
                     return Ok(Cache::Miss);
                 };
-                let read = CacheRead::from_directory_with_max_size(path.clone(), Some(max_size))?;
-                touch_entry(&path);
+                let read =
+                    CacheRead::from_directory_with_max_size(path.clone(), Some(max_size), link)?;
+                // Prefer the data inode's atime so hard-linked and symlinked
+                // outputs can extend retention without another metadata write.
+                if !read.touch_directory_data_atime() {
+                    touch_manifest(&path);
+                }
                 Ok(Cache::Hit(read))
             })
             .await?
@@ -794,7 +883,7 @@ impl Storage for DirectoryCache {
                         return Ok(None);
                     };
                     let entry = read_entry_as_cache_write(&path, max_size)?;
-                    touch_entry(&path);
+                    touch_manifest(&path);
                     entry
                 };
                 Ok(Some(Bytes::from(entry.finish()?)))
@@ -908,12 +997,21 @@ mod tests {
     }
 
     fn new_cache(root: PathBuf, pool: &tokio::runtime::Handle) -> DirectoryCache {
+        new_cache_with_link(root, pool, DirectoryCacheLinkConfig::default())
+    }
+
+    fn new_cache_with_link(
+        root: PathBuf,
+        pool: &tokio::runtime::Handle,
+        link: DirectoryCacheLinkConfig,
+    ) -> DirectoryCache {
         DirectoryCache::new_at_path(
             root,
             u64::MAX,
             pool,
             PreprocessorCacheModeConfig::default(),
             CacheMode::ReadWrite,
+            link,
             vec![],
         )
     }
@@ -1147,6 +1245,102 @@ mod tests {
     }
 
     #[test]
+    fn directory_cache_hard_links_restored_objects() {
+        let runtime = new_runtime();
+        let pool = runtime.handle().clone();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let cache = new_cache_with_link(
+            cache_root.clone(),
+            &pool,
+            DirectoryCacheLinkConfig {
+                link_type: crate::config::DirectoryCacheLinkType::HardLink,
+                required: true,
+            },
+        );
+
+        runtime
+            .block_on(cache.put(KEY, cache_write_with_object(b"object bytes")))
+            .unwrap();
+
+        let output = tempdir.path().join("output.o");
+        let read = match runtime.block_on(cache.get(KEY)).unwrap() {
+            Cache::Hit(read) => read,
+            other => panic!("expected cache hit, got {other:?}"),
+        };
+        runtime
+            .block_on(read.extract_objects(
+                vec![FileObjectSource {
+                    key: "o".to_owned(),
+                    path: output.clone(),
+                    optional: false,
+                }],
+                &pool,
+            ))
+            .unwrap();
+
+        let cached = fs::File::open(
+            cache_root
+                .join(make_key_path(KEY).unwrap())
+                .join(DIRECTORY_CACHE_OBJECTS_DIR)
+                .join("0"),
+        )
+        .unwrap();
+        let output = fs::File::open(output).unwrap();
+        assert_eq!(
+            crate::cache::directory_io::StorageFileObjectIdentity::from_file(cached.file())
+                .unwrap(),
+            crate::cache::directory_io::StorageFileObjectIdentity::from_file(output.file())
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_cache_symlinks_restored_objects() {
+        let runtime = new_runtime();
+        let pool = runtime.handle().clone();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let cache = new_cache_with_link(
+            cache_root.clone(),
+            &pool,
+            DirectoryCacheLinkConfig {
+                link_type: crate::config::DirectoryCacheLinkType::Symlink,
+                required: true,
+            },
+        );
+
+        runtime
+            .block_on(cache.put(KEY, cache_write_with_object(b"object bytes")))
+            .unwrap();
+
+        let output = tempdir.path().join("output.o");
+        let read = match runtime.block_on(cache.get(KEY)).unwrap() {
+            Cache::Hit(read) => read,
+            other => panic!("expected cache hit, got {other:?}"),
+        };
+        runtime
+            .block_on(read.extract_objects(
+                vec![FileObjectSource {
+                    key: "o".to_owned(),
+                    path: output.clone(),
+                    optional: false,
+                }],
+                &pool,
+            ))
+            .unwrap();
+
+        assert!(
+            fs::symlink_metadata(&output)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(output).unwrap(), b"object bytes");
+    }
+
+    #[test]
     fn directory_cache_does_not_expose_mutable_entry_path() {
         let runtime = new_runtime();
         let pool = runtime.handle().clone();
@@ -1258,6 +1452,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn directory_cache_hit_prefers_data_atime_over_manifest_mtime() {
+        let runtime = new_runtime();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let cache = new_cache(cache_root.clone(), runtime.handle());
+
+        runtime
+            .block_on(cache.put(KEY, cache_write_with_object(b"object")))
+            .unwrap();
+
+        let entry_path = cache_root.join(make_key_path(KEY).unwrap());
+        let manifest = entry_path.join(DIRECTORY_CACHE_MANIFEST_FILE);
+        let object = entry_path.join(DIRECTORY_CACHE_OBJECTS_DIR).join("0");
+        let old = FileTime::from_unix_time(1, 0);
+        set_file_times(&manifest, old, old).unwrap();
+        set_file_times(&object, old, old).unwrap();
+        let manifest_mtime = fs::metadata(&manifest).unwrap().modified().unwrap();
+
+        assert!(matches!(
+            runtime.block_on(cache.get(KEY)).unwrap(),
+            Cache::Hit(_)
+        ));
+
+        assert!(
+            fs::metadata(object).unwrap().accessed().unwrap()
+                > SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+        );
+        assert_eq!(
+            fs::metadata(manifest).unwrap().modified().unwrap(),
+            manifest_mtime
+        );
+    }
+
+    #[test]
+    fn directory_cache_hit_falls_back_to_manifest_without_data_object() {
+        let runtime = new_runtime();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let cache = new_cache(cache_root.clone(), runtime.handle());
+
+        runtime
+            .block_on(cache.put(KEY, CacheWrite::default()))
+            .unwrap();
+
+        let manifest = cache_root
+            .join(make_key_path(KEY).unwrap())
+            .join(DIRECTORY_CACHE_MANIFEST_FILE);
+        let old = FileTime::from_unix_time(1, 0);
+        set_file_times(&manifest, old, old).unwrap();
+
+        assert!(matches!(
+            runtime.block_on(cache.get(KEY)).unwrap(),
+            Cache::Hit(_)
+        ));
+        assert!(
+            fs::metadata(manifest).unwrap().modified().unwrap()
+                > SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn directory_cache_lru_considers_object_atime() {
+        let runtime = new_runtime();
+        let tempdir = tempfile::tempdir().unwrap();
+        let cache_root = tempdir.path().join("cache");
+        let cache = new_cache(cache_root.clone(), runtime.handle());
+
+        runtime
+            .block_on(cache.put(KEY, cache_write_with_object(b"object")))
+            .unwrap();
+
+        let entry_path = cache_root.join(make_key_path(KEY).unwrap());
+        let manifest = entry_path.join(DIRECTORY_CACHE_MANIFEST_FILE);
+        let object = entry_path.join(DIRECTORY_CACHE_OBJECTS_DIR).join("0");
+        let expected_size = directory_size(&entry_path).unwrap();
+        let output = tempdir.path().join("hard-linked-output");
+        fs::hard_link(&object, &output).unwrap();
+        let old = FileTime::from_unix_time(1, 0);
+        let recently_accessed = FileTime::from_unix_time(2, 0);
+        set_file_times(manifest, old, old).unwrap();
+        // This test runs on `noatime`, so explicitly simulate a read updating
+        // the inode through the hard-linked output path.
+        set_file_times(output, recently_accessed, old).unwrap();
+
+        // A hard-linked output shares this object inode. Its reads can advance
+        // object atime, which eviction treats as a newer last-use hint.
+        let entries = scan_entries(&cache_root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, expected_size);
+        assert_eq!(
+            entries[0].last_used,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(2)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn directory_cache_put_reads_from_open_file_source() {
@@ -1361,6 +1651,7 @@ mod tests {
             runtime.handle(),
             PreprocessorCacheModeConfig::default(),
             CacheMode::ReadOnly,
+            DirectoryCacheLinkConfig::default(),
             vec![],
         );
         assert_eq!(
@@ -1407,7 +1698,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(CacheRead::from_directory_with_max_size(entry_path, Some(u64::MAX)).is_err());
+        assert!(
+            CacheRead::from_directory_with_max_size(
+                entry_path,
+                Some(u64::MAX),
+                DirectoryCacheLinkConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1460,6 +1758,7 @@ mod tests {
             &pool,
             PreprocessorCacheModeConfig::default(),
             CacheMode::ReadWrite,
+            DirectoryCacheLinkConfig::default(),
             vec![],
         );
 
@@ -1527,6 +1826,7 @@ mod tests {
             &pool,
             PreprocessorCacheModeConfig::default(),
             CacheMode::ReadWrite,
+            DirectoryCacheLinkConfig::default(),
             vec![],
         );
 
@@ -1597,7 +1897,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(CacheRead::from_directory_with_max_size(entry_path, Some(u64::MAX)).is_err());
+        assert!(
+            CacheRead::from_directory_with_max_size(
+                entry_path,
+                Some(u64::MAX),
+                DirectoryCacheLinkConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1628,7 +1935,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(CacheRead::from_directory_with_max_size(entry_path, Some(u64::MAX)).is_err());
+        assert!(
+            CacheRead::from_directory_with_max_size(
+                entry_path,
+                Some(u64::MAX),
+                DirectoryCacheLinkConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1649,7 +1963,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(CacheRead::from_directory_with_max_size(entry_path, Some(u64::MAX)).is_err());
+        assert!(
+            CacheRead::from_directory_with_max_size(
+                entry_path,
+                Some(u64::MAX),
+                DirectoryCacheLinkConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1671,6 +1992,13 @@ mod tests {
         fs::write(&outside, b"outside").unwrap();
         std::os::unix::fs::symlink(&outside, entry_path.join(DIRECTORY_CACHE_STDOUT_FILE)).unwrap();
 
-        assert!(CacheRead::from_directory_with_max_size(entry_path, Some(u64::MAX)).is_err());
+        assert!(
+            CacheRead::from_directory_with_max_size(
+                entry_path,
+                Some(u64::MAX),
+                DirectoryCacheLinkConfig::default()
+            )
+            .is_err()
+        );
     }
 }

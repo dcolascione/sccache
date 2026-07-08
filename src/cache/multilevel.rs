@@ -48,7 +48,7 @@ use crate::compiler::PreprocessorCacheEntry;
     feature = "cos"
 ))]
 use crate::config::CacheType;
-use crate::config::{Config, DiskCacheConfig, PreprocessorCacheModeConfig, WriteErrorPolicy};
+use crate::config::{Config, DirectoryCacheConfig, PreprocessorCacheModeConfig, WriteErrorPolicy};
 use crate::errors::*;
 
 /// Increment an atomic stats counter, handling the Option check.
@@ -446,16 +446,15 @@ impl MultiLevelStorage {
                 trace!("Added disk cache level");
             } else if level_name.eq_ignore_ascii_case("directory") {
                 let directory_config =
-                    config
-                        .cache_configs
-                        .directory
-                        .clone()
-                        .unwrap_or_else(|| DiskCacheConfig {
+                    config.cache_configs.directory.clone().unwrap_or_else(|| {
+                        DirectoryCacheConfig {
                             dir: config.fallback_cache.dir.clone(),
                             size: config.fallback_cache.size,
                             preprocessor_cache_mode: config.fallback_cache.preprocessor_cache_mode,
                             rw_mode: config.fallback_cache.rw_mode,
-                        });
+                            link: Default::default(),
+                        }
+                    });
                 let preprocessor_cache_mode_config = directory_config.preprocessor_cache_mode;
                 let rw_mode = directory_config.rw_mode.into();
                 debug!(
@@ -468,6 +467,7 @@ impl MultiLevelStorage {
                     pool,
                     preprocessor_cache_mode_config,
                     rw_mode,
+                    directory_config.link,
                     config.basedirs.clone(),
                 ));
                 storages.push(directory_storage);

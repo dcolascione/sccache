@@ -638,6 +638,7 @@ pub fn storage_from_config(
             pool,
             directory_config.preprocessor_cache_mode,
             rw_mode,
+            directory_config.link,
             config.basedirs.clone(),
         )));
     }

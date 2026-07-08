@@ -14,6 +14,7 @@
 
 #[cfg(feature = "azure")]
 pub mod azure;
+pub(crate) mod bulk_stat;
 #[allow(clippy::module_inception)]
 pub mod cache;
 pub mod cache_io;

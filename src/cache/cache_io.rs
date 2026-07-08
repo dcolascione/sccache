@@ -15,6 +15,7 @@ use super::directory_io::{
     put_zip_object,
 };
 use super::utils::{get_file_mode, set_file_mode};
+use crate::config::DirectoryCacheLinkConfig;
 use crate::errors::*;
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
@@ -112,9 +113,12 @@ impl CacheRead {
     pub(crate) fn from_directory_with_max_size(
         root: PathBuf,
         max_size: Option<u64>,
+        link: DirectoryCacheLinkConfig,
     ) -> Result<CacheRead> {
         Ok(CacheRead {
-            source: CacheReadSource::Directory(DirectoryCacheRead::from_path(root, max_size)?),
+            source: CacheReadSource::Directory(DirectoryCacheRead::from_path(
+                root, max_size, link,
+            )?),
         })
     }
 
@@ -127,6 +131,20 @@ impl CacheRead {
         match &mut self.source {
             CacheReadSource::Zip(zip) => get_zip_object(zip, name, to),
             CacheReadSource::Directory(directory) => directory.get_object(name, to),
+        }
+    }
+
+    pub(crate) fn touch_directory_data_atime(&self) -> bool {
+        match &self.source {
+            CacheReadSource::Zip(_) => false,
+            CacheReadSource::Directory(directory) => directory.touch_data_atime(),
+        }
+    }
+
+    fn link_required(&self) -> bool {
+        match &self.source {
+            CacheReadSource::Zip(_) => false,
+            CacheReadSource::Directory(directory) => directory.link_required(),
         }
     }
 
@@ -207,6 +225,11 @@ impl CacheRead {
                         (Err(_), true) => continue,
                     },
                     (Err(e), false) => {
+                        if self.link_required() {
+                            return Err(e).context(
+                                "Failed to create a temporary output for required directory-cache linking",
+                            );
+                        }
                         // Fall back to writing directly to the final location
                         warn!("Failed to create temp file on the same file system: {e}");
                         let mut f = std::fs::File::create(&path)?;

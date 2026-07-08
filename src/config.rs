@@ -313,6 +313,61 @@ impl Default for DiskCacheConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryCacheLinkType {
+    HardLink,
+    #[default]
+    Reflink,
+    Symlink,
+}
+
+impl FromStr for DirectoryCacheLinkType {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "hard_link" | "hardlink" => Ok(Self::HardLink),
+            "reflink" => Ok(Self::Reflink),
+            "symlink" => Ok(Self::Symlink),
+            _ => bail!("Unknown directory cache link type {value:?}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryCacheLinkConfig {
+    #[serde(rename = "type")]
+    pub link_type: DirectoryCacheLinkType,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct DirectoryCacheConfig {
+    pub dir: PathBuf,
+    #[serde(deserialize_with = "deserialize_size_from_str")]
+    pub size: u64,
+    pub preprocessor_cache_mode: PreprocessorCacheModeConfig,
+    pub rw_mode: CacheModeConfig,
+    pub link: DirectoryCacheLinkConfig,
+}
+
+impl Default for DirectoryCacheConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_disk_cache_dir(),
+            size: default_disk_cache_size(),
+            preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
+            rw_mode: CacheModeConfig::ReadWrite,
+            link: DirectoryCacheLinkConfig::default(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub enum CacheModeConfig {
@@ -510,7 +565,7 @@ pub enum CacheType {
 pub struct CacheConfigs {
     pub azure: Option<AzureCacheConfig>,
     pub disk: Option<DiskCacheConfig>,
-    pub directory: Option<DiskCacheConfig>,
+    pub directory: Option<DirectoryCacheConfig>,
     pub gcs: Option<GCSCacheConfig>,
     pub gha: Option<GHACacheConfig>,
     pub memcached: Option<MemcachedCacheConfig>,
@@ -1268,6 +1323,10 @@ fn config_from_env() -> Result<EnvConfig> {
     let directory_dir = env::var_os("SCCACHE_DIRECTORY_DIR").map(PathBuf::from);
     let directory_sz =
         string_from_env_var("SCCACHE_DIRECTORY_CACHE_SIZE").and_then(|v| parse_size(&v));
+    let directory_link_type = string_from_env_var("SCCACHE_DIRECTORY_LINK_TYPE")
+        .map(|value| value.parse())
+        .transpose()?;
+    let directory_link_required = bool_from_env_var("SCCACHE_DIRECTORY_LINK_REQUIRED")?;
 
     let mut directory_preprocessor_mode_config = PreprocessorCacheModeConfig::activated();
     let directory_preprocessor_mode_overridden =
@@ -1287,15 +1346,21 @@ fn config_from_env() -> Result<EnvConfig> {
     let directory_any_overridden = directory_dir.is_some()
         || directory_sz.is_some()
         || directory_preprocessor_mode_overridden
-        || directory_rw_mode_overridden;
+        || directory_rw_mode_overridden
+        || directory_link_type.is_some()
+        || directory_link_required.is_some();
     let default_env_directory_cache_dir =
         || disk_dir.clone().unwrap_or_else(default_disk_cache_dir);
     let directory = if directory_any_overridden {
-        Some(DiskCacheConfig {
+        Some(DirectoryCacheConfig {
             dir: directory_dir.unwrap_or_else(default_env_directory_cache_dir),
             size: directory_sz.unwrap_or_else(default_disk_cache_size),
             preprocessor_cache_mode: directory_preprocessor_mode_config,
             rw_mode: directory_rw_mode,
+            link: DirectoryCacheLinkConfig {
+                link_type: directory_link_type.unwrap_or_default(),
+                required: directory_link_required.unwrap_or(false),
+            },
         })
     } else {
         None
@@ -2359,6 +2424,54 @@ fn test_directory_env_default_dir_follows_sccache_dir() {
         .expect("directory cache should be configured");
 
     assert_eq!(directory.dir, root);
+}
+
+#[test]
+fn test_directory_link_file_config() {
+    let config: FileConfig = toml::from_str(
+        r#"
+[cache.directory.link]
+type = "hard_link"
+required = true
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config
+            .cache
+            .directory
+            .expect("directory cache should be configured")
+            .link,
+        DirectoryCacheLinkConfig {
+            link_type: DirectoryCacheLinkType::HardLink,
+            required: true,
+        }
+    );
+}
+
+#[test]
+#[serial(config_from_env)]
+fn test_directory_link_env_config() {
+    let config = temp_env::with_vars(
+        [
+            ("SCCACHE_DIRECTORY_LINK_TYPE", Some("symlink")),
+            ("SCCACHE_DIRECTORY_LINK_REQUIRED", Some("true")),
+        ],
+        || config_from_env().unwrap(),
+    );
+
+    assert_eq!(
+        config
+            .cache
+            .directory
+            .expect("directory cache should be configured")
+            .link,
+        DirectoryCacheLinkConfig {
+            link_type: DirectoryCacheLinkType::Symlink,
+            required: true,
+        }
+    );
 }
 
 #[test]

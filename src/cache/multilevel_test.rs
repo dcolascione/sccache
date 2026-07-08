@@ -17,7 +17,7 @@ use crate::cache::CacheRead;
 use crate::cache::disk::DiskCache;
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::config::PreprocessorCacheModeConfig;
-use crate::config::{CacheConfigs, Config, DiskCacheConfig, MultiLevelConfig};
+use crate::config::{CacheConfigs, Config, DirectoryCacheConfig, MultiLevelConfig};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::env;
@@ -519,7 +519,7 @@ fn test_config_directory_level() {
     let tempdir = tempfile::tempdir().unwrap();
     let config = Config {
         cache_configs: CacheConfigs {
-            directory: Some(DiskCacheConfig {
+            directory: Some(DirectoryCacheConfig {
                 dir: tempdir.path().to_owned(),
                 ..Default::default()
             }),

@@ -74,6 +74,9 @@ size = 7516192768 # 7 GiBytes
 dir = "/tmp/.cache/sccache"
 size = 7516192768 # 7 GiBytes
 rw_mode = "READ_WRITE"
+[cache.directory.link]
+type = "reflink" # Also: "hard_link" or "symlink".
+required = false # Fall back to copying when the selected link operation fails.
 
 # See the local docs on more explanations about this mode
 [cache.disk.preprocessor_cache_mode]
@@ -251,6 +254,8 @@ export SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY="all"
 * `SCCACHE_DIRECTORY_CACHE_SIZE` maximum size of the directory-backed cache i.e. `2G` - default is 10G
 * `SCCACHE_DIRECTORY_RW_MODE` local directory cache mode, either `READ_ONLY` or `READ_WRITE`
 * `SCCACHE_DIRECTORY_DIRECT` controls preprocessor cache mode for the directory-backed cache
+* `SCCACHE_DIRECTORY_LINK_TYPE` selects cache-hit restoration using `reflink` (default), `hard_link`, or `symlink`. Hard-linked outputs share the cache object's inode and must be treated as immutable. Symlinked outputs may target a cache on another filesystem, but become dangling if their cache entries are evicted. On a hit, sccache first tries to update one data object's `atime`; only if that fails does it update manifest `mtime`. Eviction uses the newer of manifest `mtime` and object `atime`.
+* `SCCACHE_DIRECTORY_LINK_REQUIRED` fails cache-hit restoration when the selected link operation fails instead of falling back to a full copy. It is disabled by default.
 
 #### s3 compatible
 
