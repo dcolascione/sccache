@@ -327,8 +327,43 @@ This is most useful when using sccache for Rust compilation, as rustc supports u
 
 ---
 
-Normalizing Paths with `SCCACHE_BASEDIRS`
+Normalizing Paths with `path_transforms`
+----------------------------------------
+
+Regex path transforms make cache keys and compiler debug paths stable across
+worktrees and generated build roots:
+
+```toml
+[[path_transforms]]
+from = '~/codex\.[^/]+'
+to = '/workspace'
+
+[[path_transforms]]
+from = '~/.cargo/builds/cargo/[^/]+'
+to = '/cargo-build'
+```
+
+`from` matches complete normalized absolute path ancestors. It must begin with
+`/`, a Windows drive root such as `C:/`, or use `~` exactly or `~/...` for the
+current home directory. Named-user and relative forms are rejected. Later rules
+win, and `to` may use regex captures such as `$1` or `${name}`. Concrete matched
+source prefixes and the `from` regex are not cache-key inputs, so adding a new
+worktree already covered by a rule does not invalidate existing entries.
+
+Rust compilations receive `--remap-path-prefix`; GCC and Clang C/C++
+compilations receive `-ffile-prefix-map`. The behavior is supported in daemon,
+client-side, and serverless modes. A matching transform for another compiler
+kind is a hard error.
+
+See [Configuration](docs/Configuration.md) for full matching semantics and
+Cargo out-of-line build directory examples.
+
+Legacy Path Normalization with `SCCACHE_BASEDIRS`
 -----------------------------------------
+
+`SCCACHE_BASEDIRS` remains supported as compatibility shorthand for mapping
+each configured base directory to `.`. New configurations should prefer
+`path_transforms`.
 
 By default, sccache requires absolute paths to match for cache hits. To enable cache sharing across different build directories, you can set `SCCACHE_BASEDIRS` to strip a base directory from paths before hashing:
 

@@ -379,6 +379,7 @@ pub fn preprocessor_cache_entry_hash_key(
     extra_hashes: &[String],
     env_vars: &[(OsString, OsString)],
     input_file: &Path,
+    input_file_key: &Path,
     plusplus: bool,
     config: PreprocessorCacheModeConfig,
     basedirs: &[Vec<u8>],
@@ -414,7 +415,7 @@ pub fn preprocessor_cache_entry_hash_key(
     // - Compiling b/x.c results in a false cache hit since a/x.c and b/x.c
     // share preprocessor cache entries and a/r.h exists.
     let mut buf = vec![];
-    encode_path(&mut buf, input_file)?;
+    encode_path(&mut buf, input_file_key)?;
 
     // Strip basedirs from the input file path if configured
     let buf_to_hash = strip_basedirs(&buf, basedirs);
@@ -678,6 +679,7 @@ mod test {
             &[],
             &[],
             &file1_path,
+            &file1_path,
             false,
             config,
             &dirs,
@@ -691,6 +693,7 @@ mod test {
             &[],
             &[],
             &[],
+            &file2_path,
             &file2_path,
             false,
             config,
@@ -712,6 +715,7 @@ mod test {
             &[],
             &[],
             &file1_path,
+            &file1_path,
             false,
             config,
             &dirs[..1],
@@ -725,6 +729,7 @@ mod test {
             &[],
             &[],
             &[],
+            &file2_path,
             &file2_path,
             false,
             config,
@@ -746,6 +751,7 @@ mod test {
             &[],
             &[],
             &file1_path,
+            &file1_path,
             false,
             config,
             &[],
@@ -759,6 +765,7 @@ mod test {
             &[],
             &[],
             &[],
+            &file2_path,
             &file2_path,
             false,
             config,

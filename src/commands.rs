@@ -19,6 +19,7 @@ use crate::compiler::ColorMode;
 use crate::config::{Config, default_disk_cache_dir};
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
+use crate::path_transform::PathTransforms;
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
 use crate::server::{self, DistInfo, ServerInfo, ServerStartup, ServerStats};
 use crate::util::{daemonize, new_client_runtime};
@@ -525,7 +526,7 @@ where
     T: CommandCreatorSync,
 {
     let result = match &response {
-        CompileResponse::CompileStarted => {
+        CompileResponse::CompileStarted | CompileResponse::CompileStartedWithArguments(_) => {
             debug!("Server sent CompileStarted");
             // Wait for CompileFinished.
             match conn.read_one_response() {
@@ -573,7 +574,7 @@ fn handle_compile_result<T>(
     response: CompileResponse,
     finished: Option<CompileFinished>,
     exe: &Path,
-    cmdline: Vec<OsString>,
+    mut cmdline: Vec<OsString>,
     cwd: &Path,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -588,12 +589,22 @@ where
             }
             // Server disconnected before sending CompileFinished; fall back to local compilation.
         }
+        CompileResponse::CompileStartedWithArguments(arguments) => {
+            if let Some(finished) = finished {
+                return handle_compile_finished(finished, stdout, stderr);
+            }
+            cmdline = arguments;
+        }
         CompileResponse::UnsupportedCompiler(s) => {
             debug!("Server sent UnsupportedCompiler: {:?}", s);
             bail!("Compiler not supported: {:?}", s);
         }
         CompileResponse::UnhandledCompile => {
             debug!("Server sent UnhandledCompile");
+        }
+        CompileResponse::UnhandledCompileWithArguments(arguments) => {
+            debug!("Server sent UnhandledCompileWithArguments");
+            cmdline = arguments;
         }
     }
 
@@ -655,6 +666,7 @@ fn do_compile_in_process<C>(
     jobserver: &Client,
     runtime: &mut Runtime,
     storage: Arc<dyn Storage>,
+    path_transforms: PathTransforms,
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
@@ -670,9 +682,10 @@ where
     let exe_path = which_in(exe, path, cwd)?;
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = server::WaitUntilZero::new();
-    let service = server::SccacheService::<C>::new(
+    let service = server::SccacheService::<C>::new_with_path_transforms(
         server::DistClientContainer::new_disabled(),
         storage,
+        path_transforms,
         jobserver,
         runtime.handle().clone(),
         tx,
@@ -708,6 +721,7 @@ pub fn do_compile_client_side<C>(
     jobserver: &Client,
     runtime: &mut Runtime,
     conn: ServerConnection,
+    path_transforms: PathTransforms,
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
@@ -726,6 +740,7 @@ where
         jobserver,
         runtime,
         Arc::new(storage),
+        path_transforms,
         exe,
         cmdline,
         cwd,
@@ -949,6 +964,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &jobserver,
                     &mut runtime,
                     storage,
+                    config.path_transforms.clone(),
                     exe.as_ref(),
                     cmdline,
                     &cwd,
@@ -974,6 +990,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &jobserver,
                     &mut runtime,
                     conn,
+                    config.path_transforms.clone(),
                     exe.as_ref(),
                     cmdline,
                     &cwd,
@@ -1046,46 +1063,85 @@ mod test {
         }
     }
 
-    /// A mid-compile server disconnect: the server sends CompileStarted then drops the
-    /// connection before CompileFinished.  handle_compile_response must fall back to
-    /// local compilation rather than panic.
+    /// Existing disconnect recovery executes the compiler locally when the daemon
+    /// vanishes before `CompileFinished`; it must use the server-provided normalized
+    /// arguments rather than the original command line.
     #[test]
-    fn test_handle_compile_response_disconnect_falls_back_to_local() {
+    fn test_disconnect_executes_locally_with_rewritten_arguments() {
         let mut runtime = make_runtime();
         let client = Client::new_num(1);
         let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
-        // exit_status takes a raw platform value: on Unix the wait(2) encoding
-        // puts the exit code in bits 15:8, so exit code 1 is `1 << 8`.
-        // On Windows the raw value is the exit code directly.
         #[cfg(unix)]
         let exit_val: ExitStatusValue = 1 << 8;
         #[cfg(windows)]
         let exit_val: ExitStatusValue = 1;
+        let rewritten = vec![
+            OsString::from("foo.c"),
+            OsString::from("--remap-path-prefix"),
+            OsString::from("/worktree=/workspace"),
+        ];
+        let expected = rewritten.clone();
         creator
             .lock()
             .unwrap()
-            .next_command_spawns(Ok(MockChild::new(exit_status(exit_val), "", "")));
+            .next_command_calls(move |arguments| {
+                assert_eq!(arguments, expected);
+                Ok(MockChild::new(exit_status(exit_val), "", ""))
+            });
 
         let mut conn = ServerConnection::new(Box::new(DisconnectedConnection)).unwrap();
-        let exe = Path::new("cc");
-        let cmdline = vec![OsString::from("foo.c")];
-        let cwd = Path::new("/");
         let mut stdout = vec![];
         let mut stderr = vec![];
-
         let code = handle_compile_response(
             creator,
             &mut runtime,
             &mut conn,
-            CompileResponse::CompileStarted,
-            exe,
-            cmdline,
-            cwd,
+            CompileResponse::CompileStartedWithArguments(rewritten),
+            Path::new("rustc"),
+            vec![OsString::from("foo.c")],
+            Path::new("/"),
             &mut stdout,
             &mut stderr,
         )
         .unwrap();
 
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_unhandled_compile_uses_rewritten_arguments() {
+        let mut runtime = make_runtime();
+        let client = Client::new_num(1);
+        let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
+        let rewritten = vec![
+            OsString::from("-c"),
+            OsString::from("foo.cc"),
+            OsString::from("-ffile-prefix-map=/worktree=/workspace"),
+        ];
+        let expected = rewritten.clone();
+        creator
+            .lock()
+            .unwrap()
+            .next_command_calls(move |arguments| {
+                assert_eq!(arguments, expected);
+                Ok(MockChild::new(exit_status(0), "", ""))
+            });
+
+        let mut stdout = vec![];
+        let mut stderr = vec![];
+        let code = handle_compile_result(
+            creator,
+            &mut runtime,
+            CompileResponse::UnhandledCompileWithArguments(rewritten),
+            None,
+            Path::new("c++"),
+            vec![OsString::from("-c"), OsString::from("foo.cc")],
+            Path::new("/"),
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
     }
 }

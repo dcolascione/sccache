@@ -25,6 +25,7 @@ use crate::dist;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
+use crate::path_transform::{PathTransforms, ResolvedPathTransforms};
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
     hash_all, strip_basedirs,
@@ -141,6 +142,7 @@ struct CCompilation<I: CCompilerImpl> {
     compiler: I,
     cwd: PathBuf,
     env_vars: Vec<(OsString, OsString)>,
+    path_transforms: ResolvedPathTransforms,
 }
 
 /// Supported C compilers.
@@ -166,6 +168,61 @@ pub enum CCompilerKind {
     Nvhpc,
     /// Tasking VX
     TaskingVX,
+}
+
+fn resolve_path_transforms(
+    config: &PathTransforms,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+    parsed_args: &ParsedArguments,
+) -> ResolvedPathTransforms {
+    let mut resolver = config.resolver(cwd);
+    resolver.add_env(env_vars);
+    resolver.add_path(&parsed_args.input);
+    if let Some(depfile) = &parsed_args.depfile {
+        resolver.add_path(depfile);
+    }
+    for output in parsed_args.outputs.values() {
+        resolver.add_path(&output.path);
+    }
+    for path in parsed_args
+        .extra_dist_files
+        .iter()
+        .chain(&parsed_args.extra_hash_files)
+    {
+        resolver.add_path(path);
+    }
+    for argument in parsed_args
+        .dependency_args
+        .iter()
+        .chain(&parsed_args.preprocessor_args)
+        .chain(&parsed_args.common_args)
+        .chain(&parsed_args.arch_args)
+        .chain(&parsed_args.unhashed_args)
+    {
+        resolver.add_os_str(argument);
+    }
+    resolver.finish()
+}
+
+fn transform_env_vars(
+    transforms: &ResolvedPathTransforms,
+    env_vars: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    env_vars
+        .iter()
+        .map(|(key, value)| (key.clone(), transforms.transform_os_str(value)))
+        .collect()
+}
+
+fn transform_arguments(
+    transforms: &ResolvedPathTransforms,
+    arguments: &[OsString],
+) -> Vec<OsString> {
+    arguments
+        .iter()
+        .map(|argument| transforms.transform_os_str(argument))
+        .collect()
 }
 
 /// An interface to a specific C compiler.
@@ -201,6 +258,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         T: CommandCreatorSync;
     /// Generate a command that can be used to invoke the C compiler to perform
     /// the compilation.
+    #[allow(clippy::too_many_arguments)]
     fn generate_compile_commands<T>(
         &self,
         path_transformer: &mut dist::PathTransformer,
@@ -208,6 +266,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        path_transforms: &ResolvedPathTransforms,
         rewrite_includes_only: bool,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
@@ -375,22 +434,50 @@ where
         rewrite_includes_only: bool,
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
+        path_transforms: &PathTransforms,
     ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
 
+        let resolved_path_transforms =
+            resolve_path_transforms(path_transforms, &cwd, &env_vars, &self.parsed_args);
+        if !resolved_path_transforms.is_empty()
+            && !matches!(
+                self.compiler.kind(),
+                CCompilerKind::Gcc | CCompilerKind::Clang
+            )
+        {
+            bail!(
+                "path transforms are not supported for compiler {:?}",
+                self.compiler.kind()
+            );
+        }
+        let normalized_env_vars = transform_env_vars(&resolved_path_transforms, &env_vars);
+
         let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
         // Create an argument vector containing both preprocessor and arch args, to
-        // use in creating a hash key
-        let mut preprocessor_and_arch_args = self.parsed_args.preprocessor_args.clone();
-        preprocessor_and_arch_args.extend(self.parsed_args.arch_args.clone());
-        // common_args is used in preprocessing too
-        preprocessor_and_arch_args.extend(self.parsed_args.common_args.clone());
+        // use in creating a hash key.
+        let mut preprocessor_and_arch_args = transform_arguments(
+            &resolved_path_transforms,
+            &self.parsed_args.preprocessor_args,
+        );
+        preprocessor_and_arch_args.extend(transform_arguments(
+            &resolved_path_transforms,
+            &self.parsed_args.arch_args,
+        ));
+        // common_args is used in preprocessing too.
+        preprocessor_and_arch_args.extend(transform_arguments(
+            &resolved_path_transforms,
+            &self.parsed_args.common_args,
+        ));
+        preprocessor_and_arch_args.extend(resolved_path_transforms.cache_key_args());
 
         let absolute_input_path: Cow<'_, _> = if self.parsed_args.input.is_absolute() {
             Cow::Borrowed(&self.parsed_args.input)
         } else {
             Cow::Owned(cwd.join(&self.parsed_args.input))
         };
+        let normalized_input_path =
+            resolved_path_transforms.transform_path(absolute_input_path.as_ref());
 
         // Try to look for a cached preprocessing step for this compilation
         // request.
@@ -449,8 +536,9 @@ where
                 self.parsed_args.language,
                 &preprocessor_and_arch_args,
                 &extra_hashes,
-                &env_vars,
+                &normalized_env_vars,
                 &absolute_input_path,
+                &normalized_input_path,
                 self.compiler.plusplus(),
                 preprocessor_cache_mode_config,
                 storage.basedirs(),
@@ -518,6 +606,7 @@ where
                                         compiler: self.compiler.to_owned(),
                                         cwd: cwd.clone(),
                                         env_vars: env_vars.clone(),
+                                        path_transforms: resolved_path_transforms.clone(),
                                     }),
                                     weak_toolchain_key,
                                 });
@@ -529,12 +618,17 @@ where
                 }
             }
 
+            let mut preprocessor_args = self.parsed_args.clone();
+            preprocessor_args
+                .common_args
+                .extend(resolved_path_transforms.file_prefix_map_args());
+
             let result = self
                 .compiler
                 .preprocess(
                     creator,
                     &self.executable,
-                    &self.parsed_args,
+                    &preprocessor_args,
                     &cwd,
                     &env_vars,
                     may_dist,
@@ -611,19 +705,31 @@ where
                 preprocessor_result.stdout.len()
             );
 
-            (preprocessor_result.stdout, include_files)
+            (
+                resolved_path_transforms
+                    .transform_bytes(&preprocessor_result.stdout)
+                    .into_owned(),
+                include_files,
+            )
         } else {
             // No preprocessing is supported - input is already preprocessed
             (
-                std::fs::read(absolute_input_path.as_path())?,
+                resolved_path_transforms
+                    .transform_bytes(&std::fs::read(absolute_input_path.as_path())?)
+                    .into_owned(),
                 HashMap::new(),
             )
         };
 
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
-        let mut common_and_arch_args = self.parsed_args.common_args.clone();
-        common_and_arch_args.extend(self.parsed_args.arch_args.clone());
+        let mut common_and_arch_args =
+            transform_arguments(&resolved_path_transforms, &self.parsed_args.common_args);
+        common_and_arch_args.extend(transform_arguments(
+            &resolved_path_transforms,
+            &self.parsed_args.arch_args,
+        ));
+        common_and_arch_args.extend(resolved_path_transforms.cache_key_args());
 
         let key = HashKeyParams::new(
             &self.executable_digest,
@@ -632,7 +738,7 @@ where
             &preprocessor_output,
         )
         .with_extra_hashes(&extra_hashes)
-        .with_env_vars(&env_vars)
+        .with_env_vars(&normalized_env_vars)
         .with_plusplus(self.compiler.plusplus())
         .with_basedirs(storage.basedirs())
         .compute();
@@ -676,6 +782,7 @@ where
                 compiler: self.compiler.clone(),
                 cwd,
                 env_vars,
+                path_transforms: resolved_path_transforms,
             }),
             weak_toolchain_key,
         })
@@ -1202,6 +1309,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             &self.parsed_args,
             &self.cwd,
             &self.env_vars,
+            &self.path_transforms,
             rewrite_includes_only,
         )
     }

@@ -44,6 +44,7 @@ mod jobserver;
 pub mod lru_disk_cache;
 mod mock_command;
 mod net;
+pub mod path_transform;
 mod protocol;
 pub mod server;
 #[doc(hidden)]

@@ -73,6 +73,76 @@ fn test_symlinks() {
 }
 
 #[test]
+fn test_serverless_path_transforms_share_cache_across_worktrees() {
+    let root = tempdir().unwrap();
+    let root = root.path();
+    let compiler_dir = root.join("rust");
+    create_mock_rustc(compiler_dir.clone());
+
+    let cache_dir = root.join("sccache");
+    let server_socket = root.join("server.sock");
+    let config_path = root.join("config");
+    let build_a = root.join("codex.foo");
+    let build_b = root.join("codex.bar");
+
+    for build_dir in [&build_a, &build_b] {
+        create_dir(build_dir).unwrap();
+        fs::write(build_dir.join("counter"), b"0").unwrap();
+        fs::write(build_dir.join("RUST_FILE.rs"), []).unwrap();
+    }
+
+    let from = format!(r"{}/codex\.[^/]+", regex::escape(&root.to_string_lossy()));
+    fs::write(
+        &config_path,
+        format!(
+            "[[path_transforms]]\nfrom = '{}'\nto = '/workspace'\n",
+            from
+        ),
+    )
+    .unwrap();
+
+    let compiler_bin = compiler_dir.join("bin");
+    let output = serverless_path_transform_command(
+        &build_a,
+        &compiler_bin,
+        &cache_dir,
+        &server_socket,
+        &config_path,
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "first serverless compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(fs::read(build_a.join("counter")).unwrap(), b"1\n");
+
+    let output = serverless_path_transform_command(
+        &build_b,
+        &compiler_bin,
+        &cache_dir,
+        &server_socket,
+        &config_path,
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "normalized serverless compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(fs::read(build_b.join("counter")).unwrap(), b"0");
+    assert_eq!(fs::read(build_b.join("RUST_FILE")).unwrap(), b"1\n");
+    assert!(
+        !server_socket.exists(),
+        "serverless compilation started a daemon"
+    );
+}
+
+#[test]
 fn test_serverless_directory_cache() {
     let root = tempdir().unwrap();
     let root = root.path();
@@ -160,6 +230,43 @@ fn test_serverless_directory_cache() {
     );
 }
 
+fn serverless_path_transform_command(
+    root: &Path,
+    compiler_bin: &Path,
+    cache_dir: &Path,
+    server_socket: &Path,
+    config_path: &Path,
+) -> ProcessCommand {
+    let mut paths: OsString = compiler_bin.into();
+    paths.push(":");
+    paths.push(var_os("PATH").unwrap());
+
+    let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_sccache"));
+    for (var, _) in std::env::vars_os() {
+        if var.to_string_lossy().starts_with("SCCACHE_") {
+            command.env_remove(var);
+        }
+    }
+    command
+        .current_dir(root)
+        .env("PATH", paths)
+        .env("SCCACHE_CONF", config_path)
+        .env("SCCACHE_SERVERLESS", "true")
+        .env("SCCACHE_DIRECTORY_DIR", cache_dir)
+        .env("SCCACHE_DIRECTORY_DIRECT", "false")
+        .env("SCCACHE_TEST_OUTPUT_FILE", "1")
+        .env("SCCACHE_TEST_REQUIRE_REMAP", "1")
+        .env("SCCACHE_SERVER_UDS", server_socket)
+        .arg("rustc")
+        .arg("RUST_FILE.rs")
+        .arg("--crate-name=sccache_rustc_tests")
+        .arg("--crate-type=lib")
+        .arg("--emit=link")
+        .arg("--out-dir")
+        .arg(root);
+    command
+}
+
 fn serverless_sccache_command(
     root: &Path,
     compiler_bin: &Path,
@@ -217,12 +324,21 @@ fn create_mock_rustc(dir: PathBuf) {
 
 set -e
 build=0
+saw_remap=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -vV)
             echo rustc 1.0.0
             exec echo "host: unknown"
+            ;;
+        --remap-path-prefix)
+            shift
+            case "$1" in
+                *=/workspace)
+                    saw_remap=1
+                    ;;
+            esac
             ;;
         +stable)
             exit 1
@@ -233,7 +349,7 @@ while [ "$#" -gt 0 ]; do
         --print)
             shift
             if [ "$1" = file-names ]; then
-                if [ -n "$SCCACHE_TEST_BARRIER_DIR" ]; then
+                if [ -n "$SCCACHE_TEST_BARRIER_DIR" ] || [ -n "$SCCACHE_TEST_OUTPUT_FILE" ]; then
                     exec echo RUST_FILE
                 fi
                 exec echo RUST_FILE.rs
@@ -254,6 +370,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$build" -eq 1 ]; then
+    if [ -n "$SCCACHE_TEST_REQUIRE_REMAP" ] && [ "$saw_remap" -ne 1 ]; then
+        exit 89
+    fi
     if [ -n "$SCCACHE_TEST_BARRIER_DIR" ]; then
         touch "$SCCACHE_TEST_BARRIER_DIR/ready-$SCCACHE_TEST_BUILD_ID"
         waited=0

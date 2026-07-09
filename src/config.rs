@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::cache::CacheMode;
+use crate::path_transform::{PathTransformConfig, PathTransforms};
 #[cfg(target_os = "windows")]
 use crate::util::normalize_win_path;
 use directories::ProjectDirs;
@@ -880,6 +881,8 @@ pub struct FileConfig {
     pub server_startup_timeout_ms: Option<u64>,
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
+    /// Regex-based path prefix transformations used for cache keys and debug information.
+    pub path_transforms: Vec<PathTransformConfig>,
     pub compile: CompileExecutionConfig,
 }
 
@@ -899,6 +902,7 @@ struct FileConfigWire {
     dist: DistConfig,
     server_startup_timeout_ms: Option<u64>,
     basedirs: Vec<String>,
+    path_transforms: Vec<PathTransformConfig>,
     compile: FileCompileExecutionConfig,
     client_side_mode: Option<bool>,
 }
@@ -914,6 +918,7 @@ impl<'de> Deserialize<'de> for FileConfig {
             dist: wire.dist,
             server_startup_timeout_ms: wire.server_startup_timeout_ms,
             basedirs: wire.basedirs,
+            path_transforms: wire.path_transforms,
             compile: CompileExecutionConfig {
                 client_side_mode: wire
                     .compile
@@ -1457,6 +1462,8 @@ pub struct Config {
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's CCACHE_BASEDIR.
     pub basedirs: Vec<Vec<u8>>,
+    /// Path transformations used to normalize cache keys and compiler artifacts.
+    pub path_transforms: PathTransforms,
     pub compile: CompileExecutionConfig,
 }
 
@@ -1480,6 +1487,7 @@ impl Config {
             dist,
             server_startup_timeout_ms,
             basedirs: file_basedirs,
+            path_transforms: file_path_transforms,
             compile: file_compile,
         } = file_conf;
         conf_caches.merge(cache);
@@ -1544,6 +1552,8 @@ impl Config {
             debug!("Using basedirs for path normalization: {:?}", basedirs_str);
         }
 
+        let path_transforms = PathTransforms::new(file_path_transforms, &basedirs)?;
+
         let compile = CompileExecutionConfig::resolve(env_compile, file_compile, &dist)?;
 
         if compile.serverless && conf_caches.multilevel.is_some() {
@@ -1561,6 +1571,7 @@ impl Config {
             dist,
             server_startup_timeout,
             basedirs,
+            path_transforms,
             compile,
         })
     }
@@ -1835,6 +1846,29 @@ fn test_string_from_env_var() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn path_transform_config_supports_named_capture_replacements() {
+    let file_config: FileConfig = toml::from_str(
+        r#"
+[[path_transforms]]
+from = '/home/(?P<user>[^/]+)/codex\.[^/]+'
+to = '/workspace/${user}'
+"#,
+    )
+    .unwrap();
+    let config = Config::from_env_and_file_configs(EnvConfig::default(), file_config).unwrap();
+    let resolved = config
+        .path_transforms
+        .resolver(Path::new("/home/alice/codex.foo/crate"))
+        .finish();
+
+    assert_eq!(
+        resolved.transform_path(Path::new("/home/alice/codex.foo/crate/src/lib.rs")),
+        Path::new("/workspace/alice/crate/src/lib.rs")
+    );
+}
+
 #[test]
 fn serverless_config_precedence_and_client_side_exclusion() {
     let config = Config::from_env_and_file_configs(
@@ -2033,6 +2067,7 @@ fn config_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2087,6 +2122,7 @@ fn config_overrides() {
             dist: Default::default(),
             server_startup_timeout: None,
             basedirs: vec![],
+            path_transforms: PathTransforms::default(),
             compile: Default::default(),
         }
     );
@@ -2107,6 +2143,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2125,6 +2162,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2143,6 +2181,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2161,6 +2200,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2183,6 +2223,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2201,6 +2242,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2219,6 +2261,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2237,6 +2280,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2253,6 +2297,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -2551,6 +2596,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        path_transforms: vec![],
         compile: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
@@ -2586,6 +2632,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        path_transforms: vec![],
         compile: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
@@ -2980,6 +3027,7 @@ key_prefix = "cosprefix"
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
+            path_transforms: vec![],
             compile: Default::default(),
         }
     );
@@ -3074,6 +3122,7 @@ size = "7g"
             },
             server_startup_timeout_ms: None,
             basedirs: vec![],
+            path_transforms: vec![],
             compile: Default::default(),
         }
     );
@@ -3099,6 +3148,7 @@ fn test_integration_config_normalizes_and_strips() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -3134,6 +3184,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -3165,6 +3216,7 @@ fn test_integration_windows_path_normalization() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -3197,6 +3249,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -3229,6 +3282,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -3260,6 +3314,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -3296,6 +3351,7 @@ fn test_integration_paths_with_dots_normalized() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 
@@ -3328,6 +3384,7 @@ fn test_integration_windows_mixed_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
+        path_transforms: vec![],
         compile: Default::default(),
     };
 

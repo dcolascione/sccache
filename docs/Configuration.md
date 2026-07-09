@@ -26,6 +26,43 @@ server_startup_timeout_ms = 10000
 basedirs = ["/home/user/project"]
 # basedirs = ["/home/user/project", "/home/user/workspace"]
 
+# General path normalization is configured with ordered regex transforms.
+# Each `from` regex is matched against complete normalized absolute path
+# ancestors. Later matching rules win. A leading `~/` expands to the current
+# user's home directory.
+#
+# `to` is a regex replacement and may use `$1` or `${name}` capture groups.
+# `from` must begin with `/`, a Windows drive root such as `C:/`, or use `~`
+# exactly or `~/...` for the current home directory. Named-user forms such as
+# `~alice/` and relative regexes are rejected.
+# The concrete matched source prefix and the `from` regex are not included in
+# cache keys; only the stable destination is. A regex that already covers
+# future worktrees therefore does not invalidate existing cache entries.
+[[path_transforms]]
+from = '~/codex\.[^/]+'
+to = '/workspace'
+
+# Cargo can place build output outside the worktree when using, for example,
+# build-dir = "{cargo-cache-home}/builds/cargo/{workspace-path-hash}".
+# Normalize that generated workspace hash independently.
+[[path_transforms]]
+from = '~/.cargo/builds/cargo/[^/]+'
+to = '/cargo-build'
+
+# Named captures are also supported:
+# [[path_transforms]]
+# from = '/home/(?P<user>[^/]+)/codex\.[^/]+'
+# to = '/workspace/${user}'
+#
+# Path transforms apply in daemon, client-side, and serverless modes.
+# Rust receives `--remap-path-prefix`; GCC and Clang C/C++ receive
+# `-ffile-prefix-map`. If a configured transform matches an invocation for any
+# other compiler kind, sccache fails the request instead of compiling with
+# unnormalized debug paths.
+#
+# `basedirs` remains supported for compatibility and behaves like a path
+# transform from each base directory to `.`.
+
 [compile]
 # Run the compile and cache pipeline in this process without a local daemon.
 # Requires the directory cache or one remote backend; distributed and

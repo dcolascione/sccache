@@ -19,6 +19,7 @@ use crate::compiler::{
     SingleCompileCommand, clang,
 };
 use crate::mock_command::{CommandCreatorSync, RunCommand};
+use crate::path_transform::ResolvedPathTransforms;
 use crate::util::{OsStrExt, run_input_output};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
@@ -103,6 +104,7 @@ impl CCompilerImpl for Gcc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        path_transforms: &ResolvedPathTransforms,
         rewrite_includes_only: bool,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
@@ -118,6 +120,7 @@ impl CCompilerImpl for Gcc {
             parsed_args,
             cwd,
             env_vars,
+            path_transforms,
             self.kind(),
             rewrite_includes_only,
             language_to_gcc_arg,
@@ -934,6 +937,7 @@ pub fn generate_compile_commands<F>(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
+    path_transforms: &ResolvedPathTransforms,
     kind: CCompilerKind,
     rewrite_includes_only: bool,
     language_to_arg: F,
@@ -974,6 +978,7 @@ where
     arguments.extend_from_slice(&parsed_args.dependency_args);
     arguments.extend_from_slice(&parsed_args.unhashed_args);
     arguments.extend_from_slice(&parsed_args.common_args);
+    arguments.extend(path_transforms.file_prefix_map_args());
     arguments.extend_from_slice(&parsed_args.arch_args);
 
     if matches!(parsed_args.color_mode, ColorMode::On | ColorMode::Auto) {
@@ -1053,6 +1058,13 @@ where
                 arguments.push("-fpreprocessed".into());
             }
             arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
+            for (from, to) in path_transforms.mappings() {
+                arguments.push(format!(
+                    "-ffile-prefix-map={}={}",
+                    path_transformer.as_dist_abs(from)?,
+                    to.to_str()?
+                ));
+            }
             Some(dist::CompileCommand {
                 executable: path_transformer.as_dist(executable)?,
                 arguments,
@@ -2471,6 +2483,7 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
+            &ResolvedPathTransforms::default(),
             CCompilerKind::Gcc,
             false,
             language_to_gcc_arg,
@@ -2532,6 +2545,7 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
+            &ResolvedPathTransforms::default(),
             CCompilerKind::Gcc,
             false,
             language_to_gcc_arg,
@@ -2591,6 +2605,7 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
+            &ResolvedPathTransforms::default(),
             CCompilerKind::Gcc,
             false,
             language_to_gcc_arg,
@@ -2620,6 +2635,7 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
+            &ResolvedPathTransforms::default(),
             CCompilerKind::Clang,
             false,
             language_to_gcc_arg,

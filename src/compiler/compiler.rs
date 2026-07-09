@@ -34,6 +34,7 @@ use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache;
 use crate::mock_command::{CommandChild, CommandCreatorSync, RunCommand, exit_status};
+use crate::path_transform::PathTransforms;
 use crate::server;
 use crate::util::{fmt_duration_as_secs, resolve_compiler_avoiding_wrapper, run_input_output};
 use crate::{counted_array, dist};
@@ -511,6 +512,7 @@ where
         rewrite_includes_only: bool,
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
+        path_transforms: &PathTransforms,
     ) -> Result<HashResult<T>>;
 
     /// Return the state of any `--color` option passed to the compiler.
@@ -549,6 +551,7 @@ where
                 rewrite_includes_only,
                 storage.clone(),
                 cache_control,
+                service.path_transforms(),
             )
             .await;
         debug!(
@@ -2421,6 +2424,7 @@ LLVM version: 6.0",
                         false,
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         CacheControl::Default,
+                        &PathTransforms::default(),
                     )
                     .wait()
                     .unwrap()
@@ -2489,6 +2493,7 @@ LLVM version: 6.0",
                         false,
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         CacheControl::Default,
+                        &PathTransforms::default(),
                     )
                     .wait()
                     .unwrap()
@@ -2499,6 +2504,150 @@ LLVM version: 6.0",
         assert_ne!(results[0].key, results[1].key);
         assert_ne!(results[1].key, results[2].key);
         assert_ne!(results[0].key, results[2].key);
+    }
+
+    #[cfg(unix)]
+    #[test_case("g++", "compiler_id=gcc", true ; "gcc cxx with preprocessor cache")]
+    #[test_case("g++", "compiler_id=gcc", false ; "gcc cxx without preprocessor cache")]
+    #[test_case("clang++", "compiler_id=clang", true ; "clang cxx with preprocessor cache")]
+    #[test_case("clang++", "compiler_id=clang", false ; "clang cxx without preprocessor cache")]
+    fn test_path_transforms_normalize_cxx_worktrees(
+        compiler_name: &str,
+        compiler_id: &str,
+        preprocessor_cache_mode: bool,
+    ) {
+        let fixture = TestFixture::new();
+        let compiler_path = fixture.mk_bin(compiler_name).unwrap();
+        let creator = new_creator();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), compiler_id, "")),
+        );
+        let compiler = get_compiler_info(
+            creator.clone(),
+            &compiler_path,
+            fixture.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+
+        let worktree_a = fixture.tempdir.path().join("codex.foo");
+        let worktree_b = fixture.tempdir.path().join("codex.bar");
+        let build_a = fixture.tempdir.path().join("cargo-builds/workspace-hash-a");
+        let build_b = fixture.tempdir.path().join("cargo-builds/workspace-hash-b");
+        let rule = |from: &Path, to: &str| crate::path_transform::PathTransformConfig {
+            from: regex::escape(&from.to_string_lossy()),
+            to: to.to_owned(),
+        };
+        let transforms_a = PathTransforms::new(
+            vec![
+                rule(&worktree_a, "/workspace"),
+                rule(&build_a, "/cargo-build"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let transforms_b = PathTransforms::new(
+            vec![
+                rule(&fixture.tempdir.path().join("codex.qux"), "/workspace"),
+                rule(&worktree_b, "/workspace"),
+                rule(&build_b, "/cargo-build"),
+            ],
+            &[],
+        )
+        .unwrap();
+
+        let hash_and_commands = |worktree: &Path, build_dir: &Path, transforms: &PathTransforms| {
+            std::fs::create_dir_all(worktree).unwrap();
+            std::fs::create_dir_all(build_dir).unwrap();
+            let source = worktree.join("foo.cc");
+            let output = build_dir.join("foo.o");
+            std::fs::write(&source, "int foo() { return 0; }\n").unwrap();
+
+            let arguments = ovec![
+                "-c",
+                source.as_os_str(),
+                "-o",
+                output.as_os_str(),
+                format!("-DWORKTREE={}", worktree.display())
+            ];
+            let mut hasher = match compiler.parse_arguments(&arguments, worktree, &[]) {
+                CompilerArguments::Ok(hasher) => hasher,
+                result => panic!("unexpected parse result: {result:?}"),
+            };
+
+            let workspace_map = OsString::from(format!(
+                "-ffile-prefix-map={}=/workspace",
+                worktree.display()
+            ));
+            let build_map = OsString::from(format!(
+                "-ffile-prefix-map={}=/cargo-build",
+                build_dir.display()
+            ));
+            let preprocessor_workspace_map = workspace_map.clone();
+            let preprocessor_build_map = build_map.clone();
+            let preprocessor_output =
+                format!("# 1 \"{}\"\nint foo() {{ return 0; }}\n", source.display());
+            next_command_calls(&creator, move |arguments| {
+                assert!(arguments.contains(&preprocessor_workspace_map));
+                assert!(arguments.contains(&preprocessor_build_map));
+                Ok(MockChild::new(
+                    exit_status(0),
+                    preprocessor_output.clone(),
+                    "",
+                ))
+            });
+
+            let result = hasher
+                .generate_hash_key(
+                    &creator,
+                    worktree.to_owned(),
+                    vec![
+                        ("WORKTREE".into(), worktree.as_os_str().to_owned()),
+                        ("BUILD_DIR".into(), build_dir.as_os_str().to_owned()),
+                    ],
+                    false,
+                    pool,
+                    false,
+                    Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                    CacheControl::Default,
+                    transforms,
+                )
+                .wait()
+                .unwrap();
+            let mut path_transformer = dist::PathTransformer::new();
+            let (local, distributed, _) = result
+                .compilation
+                .generate_compile_commands(&mut path_transformer, false)
+                .unwrap();
+            let local_arguments = local.get_arguments();
+            assert!(local_arguments.contains(&workspace_map));
+            assert!(local_arguments.contains(&build_map));
+            (result.key, distributed)
+        };
+
+        let (key_a, distributed_a) = hash_and_commands(&worktree_a, &build_a, &transforms_a);
+        let (key_b, distributed_b) = hash_and_commands(&worktree_b, &build_b, &transforms_b);
+        assert_eq!(key_a, key_b);
+
+        #[cfg(feature = "dist-client")]
+        for command in [distributed_a.unwrap(), distributed_b.unwrap()] {
+            assert!(command.arguments.iter().any(|argument| {
+                argument.starts_with("-ffile-prefix-map=") && argument.ends_with("=/workspace")
+            }));
+            assert!(command.arguments.iter().any(|argument| {
+                argument.starts_with("-ffile-prefix-map=") && argument.ends_with("=/cargo-build")
+            }));
+        }
+        #[cfg(not(feature = "dist-client"))]
+        assert!(distributed_a.is_none() && distributed_b.is_none());
     }
 
     #[test_case(true ; "with preprocessor cache")]
@@ -2555,6 +2704,7 @@ LLVM version: 6.0",
                         false,
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         CacheControl::Default,
+                        &PathTransforms::default(),
                     )
                     .wait()
                     .unwrap()

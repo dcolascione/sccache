@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
+use crate::path_transform::PathTransforms;
 use crate::protocol::{
     Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
 };
@@ -54,7 +55,7 @@ use std::mem;
 use std::os::android::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
@@ -498,8 +499,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             crate::net::SocketAddr::Net(addr) => {
                 trace!("binding TCP {addr}");
                 let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener_and_path_transforms(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    config.path_transforms.clone(),
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -514,8 +521,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::bind(path)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener_and_path_transforms(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    config.path_transforms.clone(),
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -531,8 +544,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::from_std(l)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener_and_path_transforms(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    config.path_transforms.clone(),
+                );
                 Ok((
                     srv.local_addr()
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
@@ -610,12 +629,38 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
     ) -> Self {
+        Self::with_listener_and_path_transforms(
+            listener,
+            runtime,
+            client,
+            dist_client,
+            storage,
+            PathTransforms::default(),
+        )
+    }
+
+    pub fn with_listener_and_path_transforms(
+        listener: A,
+        runtime: Runtime,
+        client: Client,
+        dist_client: DistClientContainer,
+        storage: Arc<dyn Storage>,
+        path_transforms: PathTransforms,
+    ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service = SccacheService::new(dist_client, storage, &client, pool, tx, info);
+        let service = SccacheService::new_with_path_transforms(
+            dist_client,
+            storage,
+            path_transforms,
+            &client,
+            pool,
+            tx,
+            info,
+        );
 
         SccacheServer {
             runtime,
@@ -795,6 +840,9 @@ where
 
     /// Cache storage.
     storage: Arc<dyn Storage>,
+
+    /// Path transformations used for cache keys and compiler debug information.
+    path_transforms: Arc<PathTransforms>,
 
     /// A cache of known compiler info.
     compilers: Arc<RwLock<CompilerMap<C>>>,
@@ -1013,6 +1061,30 @@ where
 use futures::TryStreamExt;
 use futures::future::Either;
 
+fn path_transform_arguments(
+    path_transforms: &PathTransforms,
+    kind: &CompilerKind,
+    cmd: &[OsString],
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<Option<Vec<OsString>>> {
+    let resolved = path_transforms.resolve_invocation(cwd, cmd, env_vars);
+    if resolved.is_empty() {
+        return Ok(None);
+    }
+
+    let mut arguments = cmd.to_vec();
+    match kind {
+        CompilerKind::Rust => arguments.extend(resolved.rustc_args()),
+        CompilerKind::C(crate::compiler::CCompilerKind::Gcc)
+        | CompilerKind::C(crate::compiler::CCompilerKind::Clang) => {
+            arguments.extend(resolved.file_prefix_map_args());
+        }
+        _ => bail!("path transforms are not supported for compiler {kind:?}"),
+    }
+    Ok(Some(arguments))
+}
+
 impl<C> SccacheService<C>
 where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
@@ -1025,10 +1097,31 @@ where
         tx: mpsc::Sender<ServerMessage>,
         info: ActiveInfo,
     ) -> SccacheService<C> {
+        Self::new_with_path_transforms(
+            dist_client,
+            storage,
+            PathTransforms::default(),
+            client,
+            rt,
+            tx,
+            info,
+        )
+    }
+
+    pub fn new_with_path_transforms(
+        dist_client: DistClientContainer,
+        storage: Arc<dyn Storage>,
+        path_transforms: PathTransforms,
+        client: &Client,
+        rt: tokio::runtime::Handle,
+        tx: mpsc::Sender<ServerMessage>,
+        info: ActiveInfo,
+    ) -> SccacheService<C> {
         SccacheService {
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            path_transforms: Arc::new(path_transforms),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1050,6 +1143,7 @@ where
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            path_transforms: Arc::default(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1085,6 +1179,7 @@ where
                 dist_client,
             ))),
             storage,
+            path_transforms: Arc::default(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt: rt.clone(),
@@ -1362,6 +1457,20 @@ where
         }
     }
 
+    pub(crate) fn path_transforms(&self) -> &PathTransforms {
+        &self.path_transforms
+    }
+
+    fn path_transform_arguments(
+        &self,
+        kind: &CompilerKind,
+        cmd: &[OsString],
+        cwd: &Path,
+        env_vars: &[(OsString, OsString)],
+    ) -> Result<Option<Vec<OsString>>> {
+        path_transform_arguments(&self.path_transforms, kind, cmd, cwd, env_vars)
+    }
+
     /// Check that we can handle and cache `cmd` when run with `compiler`.
     /// If so, run `start_compile_task` to execute it.
     async fn check_compiler(
@@ -1381,11 +1490,25 @@ where
             }
             Ok(c) => {
                 debug!("check_compiler: Supported compiler");
-                // Now check that we can handle this compiler with
-                // the provided commandline.
+                let kind = c.kind();
                 match c.parse_arguments(&cmd, &cwd, &env_vars) {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {:?}", cmd);
+                        let response =
+                            match self.path_transform_arguments(&kind, &cmd, &cwd, &env_vars) {
+                                Ok(Some(arguments)) => {
+                                    CompileResponse::CompileStartedWithArguments(arguments)
+                                }
+                                Ok(None) => CompileResponse::CompileStarted,
+                                Err(e) => {
+                                    self.stats.lock().await.requests_unsupported_compiler += 1;
+                                    return Message::WithoutBody(Response::Compile(
+                                        CompileResponse::UnsupportedCompiler(OsString::from(
+                                            e.to_string(),
+                                        )),
+                                    ));
+                                }
+                            };
 
                         let body = self
                             .clone()
@@ -1393,10 +1516,7 @@ where
                             .and_then(|res| async { Ok(Response::CompileFinished(res)) })
                             .boxed();
 
-                        return Message::WithBody(
-                            Response::Compile(CompileResponse::CompileStarted),
-                            body,
-                        );
+                        return Message::WithBody(Response::Compile(response), body);
                     }
                     CompilerArguments::CannotCache(why, extra_info) => {
                         if let Some(extra_info) = extra_info {
@@ -1410,6 +1530,24 @@ where
                         let mut stats = self.stats.lock().await;
                         stats.requests_not_cacheable += 1;
                         *stats.not_cached.entry(why.to_string()).or_insert(0) += 1;
+                        drop(stats);
+
+                        match self.path_transform_arguments(&kind, &cmd, &cwd, &env_vars) {
+                            Ok(Some(arguments)) => {
+                                return Message::WithoutBody(Response::Compile(
+                                    CompileResponse::UnhandledCompileWithArguments(arguments),
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                self.stats.lock().await.requests_unsupported_compiler += 1;
+                                return Message::WithoutBody(Response::Compile(
+                                    CompileResponse::UnsupportedCompiler(OsString::from(
+                                        e.to_string(),
+                                    )),
+                                ));
+                            }
+                        }
                     }
                     CompilerArguments::NotCompilation => {
                         debug!("parse_arguments: NotCompilation: {:?}", cmd);
@@ -2592,5 +2730,53 @@ mod tests {
                 .unwrap();
             assert!(find_s1 < find_s2);
         }
+    }
+    #[test]
+    fn path_transform_arguments_reject_unsupported_matched_compilers() {
+        let transforms = PathTransforms::new(
+            vec![crate::path_transform::PathTransformConfig {
+                from: "/workspace/[^/]+".to_owned(),
+                to: "/stable".to_owned(),
+            }],
+            &[],
+        )
+        .unwrap();
+        let arguments = vec![OsString::from("-c"), OsString::from("foo.cc")];
+        let unsupported = CompilerKind::C(crate::compiler::CCompilerKind::Msvc);
+
+        let error = path_transform_arguments(
+            &transforms,
+            &unsupported,
+            &arguments,
+            Path::new("/workspace/tree"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not supported"));
+
+        assert!(
+            path_transform_arguments(
+                &transforms,
+                &unsupported,
+                &arguments,
+                Path::new("/outside/tree"),
+                &[],
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let rewritten = path_transform_arguments(
+            &transforms,
+            &CompilerKind::Rust,
+            &arguments,
+            Path::new("/workspace/tree"),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(rewritten.windows(2).any(|pair| {
+            pair[0] == "--remap-path-prefix" && pair[1] == "/workspace/tree=/stable"
+        }));
     }
 }

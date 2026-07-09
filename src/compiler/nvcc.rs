@@ -281,6 +281,7 @@ impl CCompilerImpl for Nvcc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        _path_transforms: &crate::path_transform::ResolvedPathTransforms,
         rewrite_includes_only: bool,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,

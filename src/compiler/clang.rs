@@ -21,6 +21,7 @@ use crate::compiler::{
     CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc, write_temp_file,
 };
 use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
+use crate::path_transform::ResolvedPathTransforms;
 use crate::util::{OsStrExt, run_input_output};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
@@ -154,6 +155,7 @@ impl CCompilerImpl for Clang {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        path_transforms: &ResolvedPathTransforms,
         rewrite_includes_only: bool,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
@@ -169,6 +171,7 @@ impl CCompilerImpl for Clang {
             parsed_args,
             cwd,
             env_vars,
+            path_transforms,
             self.kind(),
             rewrite_includes_only,
             language_to_clang_arg,
@@ -1372,6 +1375,7 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
+            &ResolvedPathTransforms::default(),
             CCompilerKind::Clang,
             false,
             language_to_clang_arg,

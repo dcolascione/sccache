@@ -26,6 +26,7 @@ use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
+use crate::path_transform::{PathTransforms, ResolvedPathTransforms};
 use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
 use crate::util::{HashToDigest, OsStrExt};
 use crate::{counted_array, dist};
@@ -221,6 +222,7 @@ pub struct RustCompilation {
     cwd: PathBuf,
     /// The environment variables
     env_vars: Vec<(OsString, OsString)>,
+    path_transforms: ResolvedPathTransforms,
 }
 
 // The selection of crate types for this compilation
@@ -1335,6 +1337,7 @@ where
         _rewrite_includes_only: bool,
         _storage: Arc<dyn Storage>,
         _cache_control: CacheControl,
+        path_transforms: &PathTransforms,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
@@ -1435,6 +1438,39 @@ where
             target_json_hash
         )?;
 
+        let mut path_transform_resolver = path_transforms.resolver(&cwd);
+        path_transform_resolver.add_env(&env_vars);
+        for (argument, value) in &os_string_arguments {
+            path_transform_resolver.add_os_str(argument);
+            if let Some(value) = value {
+                path_transform_resolver.add_os_str(value);
+            }
+        }
+        for path in source_files
+            .iter()
+            .chain(&abs_externs)
+            .chain(&abs_staticlibs)
+            .chain(&target_json_files)
+        {
+            path_transform_resolver.add_path(path);
+        }
+        path_transform_resolver.add_path(&self.parsed_args.output_dir);
+        for (_, value) in &env_deps {
+            path_transform_resolver.add_os_str(value);
+        }
+        let resolved_path_transforms = path_transform_resolver.finish();
+        let normalized_os_string_arguments = os_string_arguments
+            .iter()
+            .map(|(argument, value)| {
+                (
+                    resolved_path_transforms.transform_os_str(argument),
+                    value
+                        .as_ref()
+                        .map(|value| resolved_path_transforms.transform_os_str(value)),
+                )
+            })
+            .collect::<Vec<_>>();
+
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
         // Hash inputs:
@@ -1445,14 +1481,15 @@ where
             m.update(d.as_bytes());
         }
         let weak_toolchain_key = m.clone().finish();
+        for value in resolved_path_transforms.cache_key_args() {
+            value.hash(&mut HashToDigest { digest: &mut m });
+        }
         // 3. The full commandline (self.arguments)
-        // TODO: there will be full paths here, it would be nice to
-        // normalize them so we can get cross-machine cache hits.
         // A few argument types are not passed in a deterministic order
         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
         // and append them to the rest of the arguments.
         let args = {
-            let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
+            let (mut sortables, rest): (Vec<_>, Vec<_>) = normalized_os_string_arguments
                 .iter()
                 // We exclude a few arguments from the hash:
                 //   -L, --extern, --out-dir, --diagnostic-width
@@ -1503,7 +1540,9 @@ where
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            val.hash(&mut HashToDigest { digest: &mut m });
+            resolved_path_transforms
+                .transform_os_str(val)
+                .hash(&mut HashToDigest { digest: &mut m });
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -1534,10 +1573,14 @@ where
 
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            val.hash(&mut HashToDigest { digest: &mut m });
+            resolved_path_transforms
+                .transform_os_str(val)
+                .hash(&mut HashToDigest { digest: &mut m });
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
-        cwd.hash(&mut HashToDigest { digest: &mut m });
+        resolved_path_transforms
+            .transform_path(&cwd)
+            .hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
@@ -1680,6 +1723,7 @@ where
                 dep_info,
                 cwd,
                 env_vars,
+                path_transforms: resolved_path_transforms,
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
             }),
@@ -1722,6 +1766,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             ref env_vars,
             ref host,
             ref sysroot,
+            ref path_transforms,
             ..
         } = *self;
 
@@ -1735,12 +1780,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
         trace!("[{}]: compile", crate_name);
 
+        let mut command_arguments = arguments
+            .iter()
+            .flat_map(|arg| arg.iter_os_strings())
+            .collect::<Vec<_>>();
+        command_arguments.extend(path_transforms.rustc_args());
         let command = SingleCompileCommand {
             executable: executable.to_owned(),
-            arguments: arguments
-                .iter()
-                .flat_map(|arg| arg.iter_os_strings())
-                .collect(),
+            arguments: command_arguments,
             env_vars: env_vars.to_owned(),
             cwd: cwd.to_owned(),
         };
@@ -1835,6 +1882,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 }
                 dist_arguments.push(format!("--remap-path-prefix={}={}", &dist_path, local_path));
                 remapped_disks.insert(dist_path);
+            }
+
+            for (local_path, stable_path) in path_transforms.mappings() {
+                dist_arguments.push(format!(
+                    "--remap-path-prefix={}={}",
+                    path_transformer.as_dist_abs(local_path)?,
+                    stable_path.to_str()?
+                ));
             }
 
             let sysroot_executable = sysroot
@@ -3421,6 +3476,143 @@ proc_macro false
         );
     }
 
+    #[cfg(unix)]
+    fn transformed_rust_hash_and_commands(
+        worktree: &Path,
+        build_dir: &Path,
+        path_transforms: &PathTransforms,
+    ) -> (String, Vec<OsString>, Option<dist::CompileCommand>) {
+        std::fs::create_dir_all(worktree).unwrap();
+        std::fs::create_dir_all(build_dir).unwrap();
+        let source = worktree.join("foo.rs");
+        std::fs::write(&source, "pub fn foo() {}\n").unwrap();
+
+        let arguments = ovec![
+            "--emit",
+            "link",
+            source.as_os_str(),
+            "--out-dir",
+            build_dir.as_os_str(),
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--cfg",
+            format!("cargo_target_dir=\"{}\"", build_dir.display())
+        ];
+        let parsed_args = match parse_arguments(&arguments, worktree) {
+            CompilerArguments::Ok(parsed_args) => parsed_args,
+            result => panic!("unexpected parse result: {result:?}"),
+        };
+        let mut hasher = Box::new(RustHasher {
+            executable: "rustc".into(),
+            host: "x86_64-unknown-unknown-unknown".to_owned(),
+            version: TEST_RUSTC_VERSION.to_string(),
+            sysroot: "/sysroot".into(),
+            compiler_shlibs_digests: vec![],
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader: None,
+            parsed_args,
+        });
+        let creator = new_creator();
+        mock_dep_info(&creator, &[source.to_str().unwrap()]);
+        mock_file_names(&creator, &["foo.rlib"]);
+        let runtime = single_threaded_runtime();
+        let result = hasher
+            .generate_hash_key(
+                &creator,
+                worktree.to_owned(),
+                vec![
+                    ("CARGO_MANIFEST_DIR".into(), worktree.as_os_str().to_owned()),
+                    ("CARGO_TARGET_DIR".into(), build_dir.as_os_str().to_owned()),
+                ],
+                false,
+                runtime.handle(),
+                false,
+                Arc::new(MockStorage::new(None, false)),
+                CacheControl::Default,
+                path_transforms,
+            )
+            .wait()
+            .unwrap();
+
+        let mut path_transformer = dist::PathTransformer::new();
+        let (local, distributed, _) = result
+            .compilation
+            .generate_compile_commands(&mut path_transformer, false)
+            .unwrap();
+        (result.key, local.get_arguments(), distributed)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_transforms_normalize_worktrees_and_cargo_build_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree_a = root.path().join("codex.foo");
+        let worktree_b = root.path().join("codex.bar");
+        let build_a = root.path().join("cargo-builds/workspace-hash-a");
+        let build_b = root.path().join("cargo-builds/workspace-hash-b");
+
+        let rule = |from: &Path, to: &str| crate::path_transform::PathTransformConfig {
+            from: regex::escape(&from.to_string_lossy()),
+            to: to.to_owned(),
+        };
+        let transforms_a = PathTransforms::new(
+            vec![
+                rule(&worktree_a, "/workspace"),
+                rule(&build_a, "/cargo-build"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let transforms_b = PathTransforms::new(
+            vec![
+                rule(&root.path().join("codex.qux"), "/workspace"),
+                rule(&worktree_b, "/workspace"),
+                rule(&build_b, "/cargo-build"),
+            ],
+            &[],
+        )
+        .unwrap();
+
+        let (key_a, local_a, distributed_a) =
+            transformed_rust_hash_and_commands(&worktree_a, &build_a, &transforms_a);
+        let (key_b, local_b, distributed_b) =
+            transformed_rust_hash_and_commands(&worktree_b, &build_b, &transforms_b);
+
+        assert_eq!(key_a, key_b);
+        for (arguments, worktree, build_dir) in [
+            (&local_a, &worktree_a, &build_a),
+            (&local_b, &worktree_b, &build_b),
+        ] {
+            let remaps = arguments
+                .windows(2)
+                .filter(|pair| pair[0] == "--remap-path-prefix")
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>();
+            assert!(remaps.contains(&OsString::from(format!(
+                "{}=/workspace",
+                worktree.display()
+            ))));
+            assert!(remaps.contains(&OsString::from(format!(
+                "{}=/cargo-build",
+                build_dir.display()
+            ))));
+        }
+
+        #[cfg(feature = "dist-client")]
+        for command in [distributed_a.unwrap(), distributed_b.unwrap()] {
+            assert!(command.arguments.iter().any(|argument| {
+                argument.starts_with("--remap-path-prefix=") && argument.ends_with("=/workspace")
+            }));
+            assert!(command.arguments.iter().any(|argument| {
+                argument.starts_with("--remap-path-prefix=") && argument.ends_with("=/cargo-build")
+            }));
+        }
+        #[cfg(not(feature = "dist-client"))]
+        assert!(distributed_a.is_none() && distributed_b.is_none());
+    }
+
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
     fn test_generate_hash_key(preprocessor_cache_mode: bool) {
@@ -3518,6 +3710,7 @@ proc_macro false
                 false,
                 Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                 CacheControl::Default,
+                &PathTransforms::default(),
             )
             .wait()
             .unwrap();
@@ -3610,6 +3803,7 @@ proc_macro false
                 false,
                 Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                 CacheControl::Default,
+                &PathTransforms::default(),
             )
             .wait()
             .unwrap()

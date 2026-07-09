@@ -164,6 +164,7 @@ impl CCompilerImpl for Nvhpc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        _path_transforms: &crate::path_transform::ResolvedPathTransforms,
         rewrite_includes_only: bool,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
@@ -179,6 +180,7 @@ impl CCompilerImpl for Nvhpc {
             parsed_args,
             cwd,
             env_vars,
+            _path_transforms,
             self.kind(),
             rewrite_includes_only,
             gcc::language_to_gcc_arg,

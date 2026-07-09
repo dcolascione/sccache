@@ -95,6 +95,11 @@ pub enum CompileResponse {
     UnhandledCompile,
     /// The compiler was not supported.
     UnsupportedCompiler(OsString),
+    /// The compilation started, with normalized arguments for local execution
+    /// if the daemon disconnects.
+    CompileStartedWithArguments(Vec<OsString>),
+    /// The server cannot cache this compilation, but it must run with normalized arguments.
+    UnhandledCompileWithArguments(Vec<OsString>),
 }
 
 /// Information about a finished compile, either from cache or executed locally.
