@@ -6,62 +6,97 @@
 # If specified, wait this long for the server to start up.
 server_startup_timeout_ms = 10000
 
-# Base directories to strip from source paths during cache key
-# computation.
+# Use `path_transforms` when the same source tree is built in different absolute
+# directories but should share cache entries. This happens when CI gives each
+# job a unique workspace, the same repository is checked out in several Git
+# worktrees, developers with different home directories share a cache, or a
+# build tool puts outputs under generated or hash-named directories.
 #
-# Similar to ccache's CCACHE_BASEDIR, but supports multiple paths.
+# sccache cannot assume arbitrary directories are equivalent because absolute
+# paths occur in compiler arguments, preprocessor output, and generated debug
+# information, where they can affect compiler output. It therefore hashes the
+# real paths by default. A path transform explicitly declares which varying
+# roots represent the same logical location, enabling cache hits across those
+# directories and making embedded paths reproducible.
 #
-# 'basedirs' enables cache hits across different absolute root
-# paths when compiling the same source code, such as between
-# parallel checkouts of the same project, Git worktrees, or different
-# users in a shared environment.
-# When multiple matching paths are provided, the longest prefix
-# is used.
+# `path_transforms` replaces selected machine-specific absolute path prefixes
+# with stable paths. Each `[[path_transforms]]` table defines:
 #
-# Path matching is case-insensitive on Windows and case-sensitive on other OSes.
+# - `from`: a regular expression that selects an absolute path prefix.
+# - `to`: the stable path that replaces the matched prefix.
 #
-# Example:
-#   basedir = ["/home/user/project"] results in the path prefix rewrite:
-#   "/home/user/project/src/main.c" -> "src/main.c"
-basedirs = ["/home/user/project"]
-# basedirs = ["/home/user/project", "/home/user/workspace"]
-
-# General path normalization is configured with ordered regex transforms.
-# Each `from` regex is matched against complete normalized absolute path
-# ancestors. Later matching rules win. A leading `~/` expands to the current
-# user's home directory.
-#
-# `to` is a regex replacement and may use `$1` or `${name}` capture groups.
-# `from` must begin with `/`, a Windows drive root such as `C:/`, or use `~`
-# exactly or `~/...` for the current home directory. Named-user forms such as
-# `~alice/` and relative regexes are rejected.
-# The concrete matched source prefix and the `from` regex are not included in
-# cache keys; only the stable destination is. A regex that already covers
-# future worktrees therefore does not invalidate existing cache entries.
+# This rule maps checkout directories such as `~/codex.foo` and `~/codex.bar`
+# to the same stable root:
 [[path_transforms]]
 from = '~/codex\.[^/]+'
 to = '/workspace'
 
-# Cargo can place build output outside the worktree when using, for example,
+# For example, both `~/codex.foo/crate/src/lib.rs` and
+# `~/codex.bar/crate/src/lib.rs` normalize to
+# `/workspace/crate/src/lib.rs`.
+#
+# Separate rules can normalize other unstable roots. Cargo can place build
+# output outside the worktree when using, for example,
 # build-dir = "{cargo-cache-home}/builds/cargo/{workspace-path-hash}".
-# Normalize that generated workspace hash independently.
+# This rule removes that generated workspace hash:
 [[path_transforms]]
 from = '~/.cargo/builds/cargo/[^/]+'
 to = '/cargo-build'
 
-# Named captures are also supported:
+# sccache normalizes each absolute path and tests `from` against its ancestors.
+# A matched ancestor is replaced with `to`; the rest of the path is preserved.
+# Every test is a whole-ancestor match: sccache compiles the pattern as
+# `^(?:<from>)$`. Explicit `^` and `$` anchors are allowed but redundant. A
+# literal rule such as `from = '/home/user/project'` therefore handles every
+# path below that directory without a trailing `.*`.
+#
+# `from` uses the Rust `regex` crate syntax, not PCRE:
+# https://docs.rs/regex/latest/regex/#syntax
+# It supports character classes, repetition, alternation, and capture groups,
+# but not look-around or backreferences. TOML literal strings (`'...'`) preserve
+# regex backslashes.
+#
+# `to` uses Rust regex replacement syntax, so it can refer to numbered captures
+# with `$1` and named captures with `${name}`:
+#
 # [[path_transforms]]
 # from = '/home/(?P<user>[^/]+)/codex\.[^/]+'
 # to = '/workspace/${user}'
 #
-# Path transforms apply in daemon, client-side, and serverless modes.
-# Rust receives `--remap-path-prefix`; GCC and Clang C/C++ receive
-# `-ffile-prefix-map`. If a configured transform matches an invocation for any
-# other compiler kind, sccache fails the request instead of compiling with
-# unnormalized debug paths.
+# Patterns use `/` as the path separator. On Windows, candidate paths are
+# lowercased, so literal path text in `from` should also be lowercase.
+# `from` must begin with `/`, a Windows drive root such as `c:/`, or use `~`
+# exactly or `~/...` for the current user's home directory. Named-user forms
+# such as `~alice/` and relative patterns are rejected. `to` may not contain
+# `=`.
 #
-# `basedirs` remains supported for compatibility and behaves like a path
-# transform from each base directory to `.`.
+# Rules are ordered, and the last matching rule wins. Path transforms apply in
+# daemon, client-side, and serverless modes. Rust receives
+# `--remap-path-prefix`; GCC and Clang C/C++ receive `-ffile-prefix-map`. If a
+# configured transform matches an invocation for another compiler kind,
+# sccache fails the request rather than compiling with unnormalized debug paths.
+#
+# Only the stable `to` destinations, not the concrete matched source prefixes
+# or `from` patterns, are included in cache keys. Adding another checkout that
+# an existing rule already covers does not invalidate existing cache entries.
+#
+# `basedirs` is the older shorthand for one subset of this behavior. Each entry
+# is a literal absolute directory that maps to `.`, with the longest matching
+# directory winning. It cannot use regexes, captures, or another destination.
+# For example:
+#
+# basedirs = ["/home/user/project"]
+#
+# is equivalent to this rule:
+#
+# [[path_transforms]]
+# from = '/home/user/project'
+# to = '.'
+#
+# To reproduce multiple overlapping `basedirs`, order the equivalent transforms
+# from least specific to most specific because the last matching transform
+# wins. If both forms match, `path_transforms` takes precedence. `basedirs` and
+# `SCCACHE_BASEDIRS` remain supported for existing configurations.
 
 [compile]
 # Run the compile and cache pipeline in this process without a local daemon.
@@ -222,7 +257,7 @@ Note that some env variables may need sccache server restart to take effect.
 
 * `SCCACHE_ALLOW_CORE_DUMPS` to enable core dumps by the server
 * `SCCACHE_CONF` configuration file path
-* `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths will cause an error and prevent the server from start.
+* `SCCACHE_BASEDIRS` supplies the legacy `basedirs` setting from the environment. Each entry must be an absolute directory and maps that directory to `.`. Separate entries with `;` on Windows and `:` on other operating systems; the longest matching directory wins. Matching is **case-insensitive** on Windows and **case-sensitive** elsewhere. This variable overrides `basedirs` in the configuration file. Use file-configured `path_transforms` when regex matching, capture replacement, or a destination other than `.` is required.
 * `SCCACHE_CACHED_CONF`
 * `SCCACHE_IDLE_TIMEOUT` how long the local daemon process waits for more client requests before exiting, in seconds. Set to `0` to run sccache permanently
 * `SCCACHE_STARTUP_NOTIFY` specify a path to a socket which will be used for server completion notification
