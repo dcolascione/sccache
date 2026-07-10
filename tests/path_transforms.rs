@@ -4,6 +4,8 @@
 mod harness;
 
 use harness::{sccache_client_cfg, sccache_command, write_json_cfg};
+use object::read::archive::ArchiveFile;
+use object::{Object, ObjectSection};
 use sccache::config::FileConfig;
 use sccache::path_transform::PathTransformConfig;
 use sccache::server::ServerInfo;
@@ -72,6 +74,65 @@ fn assert_success(output: Output, context: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+fn append_object_debug_sections(data: &[u8], debug_info: &mut Vec<u8>) {
+    let Ok(file) = object::File::parse(data) else {
+        return;
+    };
+
+    for section in file.sections() {
+        let Ok(name) = section.name_bytes() else {
+            continue;
+        };
+        if memchr::memmem::find(name, b"debug").is_none() {
+            continue;
+        }
+        let data = section.uncompressed_data().unwrap();
+        debug_info.extend_from_slice(&data);
+        debug_info.push(0);
+    }
+}
+
+fn artifact_debug_info(artifact: &[u8]) -> Vec<u8> {
+    let mut debug_info = Vec::new();
+    // Rust rlibs are archives; C++ compiler outputs are object files.
+    if matches!(
+        object::FileKind::parse(artifact),
+        Ok(object::FileKind::Archive)
+    ) {
+        let archive = ArchiveFile::parse(artifact).unwrap();
+        for member in archive.members() {
+            let member = member.unwrap();
+            append_object_debug_sections(member.data(artifact).unwrap(), &mut debug_info);
+        }
+    } else {
+        append_object_debug_sections(artifact, &mut debug_info);
+    }
+    debug_info
+}
+
+fn read_artifact_with_remapped_debug_info(artifact: &Path, physical_root: &Path) -> Vec<u8> {
+    let artifact_data = fs::read(artifact).unwrap();
+    let debug_info = artifact_debug_info(&artifact_data);
+    assert!(
+        !debug_info.is_empty(),
+        "{} contains no parseable debug information",
+        artifact.display()
+    );
+    assert!(
+        memchr::memmem::find(&debug_info, b"/workspace").is_some(),
+        "{} debug information does not contain /workspace",
+        artifact.display()
+    );
+
+    let physical_root = physical_root.to_string_lossy();
+    assert!(
+        memchr::memmem::find(&debug_info, physical_root.as_bytes()).is_none(),
+        "{} debug information contains physical root {physical_root:?}",
+        artifact.display()
+    );
+    artifact_data
 }
 
 fn run_compile(
@@ -173,9 +234,10 @@ fn run_real_path_transform_test(compiler_name: &str, kind: CompilerKind) {
 
     let artifact_a = build_a.join(kind.artifact_name());
     let artifact_b = build_b.join(kind.artifact_name());
+    let artifact_a_data = read_artifact_with_remapped_debug_info(&artifact_a, root_path);
+    let artifact_b_data = read_artifact_with_remapped_debug_info(&artifact_b, root_path);
     assert_eq!(
-        fs::read(&artifact_a).unwrap(),
-        fs::read(&artifact_b).unwrap(),
+        artifact_a_data, artifact_b_data,
         "{compiler_name} artifacts differ across normalized directories"
     );
 
@@ -238,7 +300,9 @@ fn run_real_path_transform_test(compiler_name: &str, kind: CompilerKind) {
         1,
         "expected exactly one cold {compiler_name} compile"
     );
-    assert_eq!(fs::read(artifact_a).unwrap(), fs::read(artifact_b).unwrap());
+    let artifact_a_data = read_artifact_with_remapped_debug_info(&artifact_a, root_path);
+    let artifact_b_data = read_artifact_with_remapped_debug_info(&artifact_b, root_path);
+    assert_eq!(artifact_a_data, artifact_b_data);
 }
 
 #[test]
