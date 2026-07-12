@@ -47,6 +47,7 @@ mod net;
 pub mod path_transform;
 mod protocol;
 pub mod server;
+mod stats_store;
 #[doc(hidden)]
 pub mod util;
 

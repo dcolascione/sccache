@@ -222,6 +222,10 @@ fn run_real_path_transform_test(compiler_name: &str, kind: CompilerKind) {
         run_compile(&compiler, kind, worktree, build_dir, |command| {
             command
                 .env("SCCACHE_CONF", &serverless_config)
+                .env(
+                    "SCCACHE_CACHED_CONF",
+                    root_path.join("serverless-cached-config"),
+                )
                 .env("SCCACHE_SERVERLESS", "true")
                 .env("SCCACHE_DIRECTORY_DIR", &cache_dir)
                 .env("SCCACHE_DIRECTORY_DIRECT", "false")

@@ -16,12 +16,13 @@ use crate::cache::{IpcStorage, Storage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
-use crate::config::{Config, default_disk_cache_dir};
+use crate::config::{Config, default_disk_cache_dir, serverless_stats_path};
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::path_transform::PathTransforms;
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
 use crate::server::{self, DistInfo, ServerInfo, ServerStartup, ServerStats};
+use crate::stats_store::StatsStore;
 use crate::util::{daemonize, new_client_runtime};
 use byteorder::{BigEndian, ByteOrder};
 use fs::{File, OpenOptions};
@@ -674,7 +675,7 @@ fn do_compile_in_process<C>(
     env_vars: Vec<(OsString, OsString)>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-) -> Result<(i32, ServerStats)>
+) -> Result<(Result<i32>, ServerStats)>
 where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
@@ -697,23 +698,26 @@ where
         args: cmdline.clone(),
         env_vars,
     };
-    let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
-    let creator = C::new(jobserver);
-    let exit_code = handle_compile_result(
-        creator,
-        runtime,
-        compile_resp,
-        finished,
-        &exe_path,
-        cmdline,
-        cwd,
-        stdout,
-        stderr,
-    )?;
+    let result = match runtime.block_on(service.compile_direct(compile)) {
+        Ok((compile_resp, finished)) => {
+            let creator = C::new(jobserver);
+            handle_compile_result(
+                creator,
+                runtime,
+                compile_resp,
+                finished,
+                &exe_path,
+                cmdline,
+                cwd,
+                stdout,
+                stderr,
+            )
+        }
+        Err(error) => Err(error),
+    };
     let stats = runtime.block_on(service.take_stats());
-    Ok((exit_code, stats))
+    Ok((result, stats))
 }
-
 /// Run a compile in client-side mode: the compile pipeline executes in this
 /// process, and only cache I/O is forwarded to the daemon via `conn`.
 #[allow(clippy::too_many_arguments)]
@@ -736,7 +740,7 @@ where
     trace!("do_compile_client_side");
     let storage = IpcStorage::connect(conn)?;
     let conn_arc = storage.conn();
-    let (exit_code, delta) = do_compile_in_process::<C>(
+    let (result, delta) = do_compile_in_process::<C>(
         jobserver,
         runtime,
         Arc::new(storage),
@@ -754,7 +758,7 @@ where
     if let Ok(mut conn) = conn_arc.lock() {
         let _ = conn.request(Request::RecordStats(Box::new(delta)));
     }
-    Ok(exit_code)
+    result
 }
 
 /// Run `cmd` and return the process exit status.
@@ -767,14 +771,18 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::ShowStats(fmt, advanced) => {
             trace!("Command::ShowStats({:?})", fmt);
+            let serverless_stats = StatsStore::new(serverless_stats_path()).read()?;
             let stats = match connect_to_server(&get_addr()) {
-                Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
-                // If there is no server, spawning a new server would start with zero stats
-                // anyways, so we can just return (mostly) empty stats directly.
+                Ok(srv) => {
+                    let mut stats =
+                        request_stats(srv).context("failed to get stats from server")?;
+                    stats.stats += serverless_stats;
+                    stats
+                }
                 Err(_) => {
                     let runtime = new_client_runtime()?;
                     let storage = storage_from_config(config, runtime.handle()).ok();
-                    runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
+                    runtime.block_on(ServerInfo::new(serverless_stats, storage.as_deref()))?
                 }
             };
             match fmt {
@@ -831,13 +839,31 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             trace!("Command::StopServer");
             println!("Stopping sccache server...");
             let server = connect_to_server(&get_addr()).context("couldn't connect to server")?;
-            let stats = request_shutdown(server)?;
+            let mut stats = request_shutdown(server)?;
+            stats.stats += StatsStore::new(serverless_stats_path()).read()?;
             stats.print(false);
         }
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
-            request_zero_stats(conn).context("couldn't zero stats on server")?;
+            if config.compile.serverless {
+                let addr = get_addr();
+                match connect_to_server(&addr) {
+                    Ok(conn) => {
+                        request_zero_stats(conn).context("couldn't zero stats on server")?;
+                    }
+                    Err(error)
+                        if error.kind() == io::ErrorKind::ConnectionRefused
+                            || (error.kind() == io::ErrorKind::NotFound && addr.is_unix_path()) => {
+                    }
+                    Err(error) => {
+                        return Err(error).context("couldn't connect to server");
+                    }
+                }
+            } else {
+                let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+                request_zero_stats(conn).context("couldn't zero stats on server")?;
+            }
+            StatsStore::new(serverless_stats_path()).zero()?;
             eprintln!("Statistics zeroed.");
         }
         #[cfg(feature = "dist-client")]
@@ -960,7 +986,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     .enable_all()
                     .build()?;
                 let storage = storage_from_config(config, runtime.handle())?;
-                let res = do_compile_in_process::<ProcessCommandCreator>(
+                let (result, stats) = do_compile_in_process::<ProcessCommandCreator>(
                     &jobserver,
                     &mut runtime,
                     storage,
@@ -972,9 +998,11 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     env_vars,
                     &mut io::stdout(),
                     &mut io::stderr(),
-                )
-                .map(|(exit_code, _stats)| exit_code);
-                return res.context("failed to execute compile");
+                )?;
+                if let Err(err) = StatsStore::new(serverless_stats_path()).merge(stats) {
+                    warn!("Failed to persist serverless statistics: {err:#}");
+                }
+                return result.context("failed to execute compile");
             }
 
             let conn = connect_or_start_server(&get_addr(), startup_timeout)?;

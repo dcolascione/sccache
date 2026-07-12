@@ -1452,6 +1452,12 @@ fn config_file(env_var: &str, leaf: &str) -> PathBuf {
     dirs.config_dir().join(leaf)
 }
 
+pub(crate) fn serverless_stats_path() -> PathBuf {
+    let mut path = config_file("SCCACHE_CACHED_CONF", "cached-config").into_os_string();
+    path.push(".stats.sqlite3");
+    path.into()
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub cache: Option<CacheType>,

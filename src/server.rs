@@ -1287,6 +1287,7 @@ where
         &self,
         compile: Compile,
     ) -> Result<(CompileResponse, Option<CompileFinished>)> {
+        self.stats.lock().await.compile_requests += 1;
         match self.handle_compile(compile).await? {
             Message::WithBody(Response::Compile(resp), body) => {
                 let finished = match body.await? {
@@ -1864,6 +1865,7 @@ impl std::ops::AddAssign for PerLanguageCount {
 
 /// Statistics about the server.
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct ServerStats {
     /// The count of client compile requests.
     pub compile_requests: u64,
