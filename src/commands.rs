@@ -771,7 +771,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::ShowStats(fmt, advanced) => {
             trace!("Command::ShowStats({:?})", fmt);
-            let serverless_stats = StatsStore::new(serverless_stats_path()).read()?;
+            let serverless_stats = StatsStore::new(serverless_stats_path(config)).read()?;
             let stats = match connect_to_server(&get_addr()) {
                 Ok(srv) => {
                     let mut stats =
@@ -840,7 +840,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             println!("Stopping sccache server...");
             let server = connect_to_server(&get_addr()).context("couldn't connect to server")?;
             let mut stats = request_shutdown(server)?;
-            stats.stats += StatsStore::new(serverless_stats_path()).read()?;
+            stats.stats += StatsStore::new(serverless_stats_path(config)).read()?;
             stats.print(false);
         }
         Command::ZeroStats => {
@@ -863,7 +863,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
                 request_zero_stats(conn).context("couldn't zero stats on server")?;
             }
-            StatsStore::new(serverless_stats_path()).zero()?;
+            StatsStore::new(serverless_stats_path(config)).zero()?;
             eprintln!("Statistics zeroed.");
         }
         #[cfg(feature = "dist-client")]
@@ -999,7 +999,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &mut io::stdout(),
                     &mut io::stderr(),
                 )?;
-                if let Err(err) = StatsStore::new(serverless_stats_path()).merge(stats) {
+                if let Err(err) = StatsStore::new(serverless_stats_path(config)).merge(stats) {
                     warn!("Failed to persist serverless statistics: {err:#}");
                 }
                 return result.context("failed to execute compile");

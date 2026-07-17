@@ -118,12 +118,33 @@ fn unsupported_compiler_statistics_are_persisted() {
 }
 
 #[test]
+fn statistics_database_is_stored_in_cache_directory() {
+    let root = tempdir().unwrap();
+    let cache_dir = root.path().join("cache");
+    let config_dir = root.path().join("config");
+    let server_socket = root.path().join("server.sock");
+
+    let output = control_command(&cache_dir, &server_socket, true)
+        .args(["--show-stats", "--stats-format=json"])
+        .output()
+        .unwrap();
+    assert_success(&output, "reading statistics");
+
+    assert!(cache_dir.join("stats.sqlite3").exists());
+    assert!(cache_dir.join("stats.sqlite3.lock").exists());
+    assert!(
+        !config_dir.exists(),
+        "statistics command wrote to the config directory"
+    );
+}
+
+#[test]
 fn corrupt_statistics_database_warns_and_rebuilds() {
     let root = tempdir().unwrap();
     let cache_dir = root.path().join("cache");
     create_dir(&cache_dir).unwrap();
     let server_socket = root.path().join("server.sock");
-    let stats_path = cache_dir.join("cached-config.stats.sqlite3");
+    let stats_path = cache_dir.join("stats.sqlite3");
     fs::write(&stats_path, b"not a sqlite database").unwrap();
 
     let output = control_command(&cache_dir, &server_socket, true)
@@ -200,7 +221,10 @@ fn base_command(cache_dir: &Path, server_socket: &Path, serverless: bool) -> Com
     }
     command
         .env("SCCACHE_CONF", cache_dir.join("missing-config"))
-        .env("SCCACHE_CACHED_CONF", cache_dir.join("cached-config"))
+        .env(
+            "SCCACHE_CACHED_CONF",
+            cache_dir.with_file_name("config").join("cached-config"),
+        )
         .env("SCCACHE_SERVERLESS", serverless.to_string())
         .env("SCCACHE_DIRECTORY_DIR", cache_dir)
         .env("SCCACHE_DIRECTORY_DIRECT", "false")
